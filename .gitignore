@@ -1,0 +1,12 @@
+# Секретные файлы и конфигурации
+credentials.env
+.env
+*.env
+
+# Временные файлы и папки IDE / системные файлы
+.DS_Store
+.idea/
+.vscode/
+*.log
+venv/
+__pycache__/
