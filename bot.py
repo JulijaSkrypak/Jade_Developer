@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot.py — Vibe Telegram Bot
+bot.py — JadeBridge Telegram Bot
 Smart Router: автоматическое переключение моделей через OpenRouter.
 """
 
@@ -52,6 +52,9 @@ ROUTER_SYSTEM_PROMPT = (
 )
 
 logging.basicConfig(level=logging.INFO)
+# Отключаем логирование HTTP-запросов (содержащих токен бота) в stdout
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 user_histories: dict[int, list] = {}
@@ -133,11 +136,23 @@ def get_system_prompt() -> str:
     """Возвращает системный промпт с актуальной датой. Вызывается при каждом запросе."""
     current_date = datetime.datetime.now().strftime("%d %B %Y")
     prompt = (
-        f"Ты умный ассистент для вайбкодинга.\n"
+        f"Ты умный ассистент JadeBridge.\n"
         f"Текущая дата: {current_date}.\n"
         "Используй эту дату при ответах на вопросы о текущих событиях, "
         "актуальных технологиях, рейтингах и версиях ПО.\n"
-        "Отвечай кратко и по делу."
+        "Отвечай кратко и по делу.\n"
+        "\n"
+        "ВАЖНОЕ ПРАВИЛО для работы с Excel-таблицами:\n"
+        "Если в данных встречается пометка вида [формула, не вычислено: <формула>], "
+        "это означает, что значение ячейки НЕ было сохранено в исходном файле — "
+        "показан только текст формулы, но не её результат. "
+        "В этом случае ты ОБЯЗАН явно сообщить пользователю об этом факте. "
+        "Ты можешь высказать предположение о вероятном результате ТОЛЬКО если "
+        "прямо обозначишь его как предположение — например: "
+        "«вероятно, результат — X, но это не подтверждено файлом: "
+        "формула не была пересчитана». "
+        "НИКОГДА не приводи предположительный результат как установленный факт, "
+        "независимо от того, насколько простой кажется формула."
     )
     import logging
     logging.getLogger(__name__).info(f"[SYSTEM PROMPT] Дата в промпте: {current_date}")
@@ -202,7 +217,7 @@ async def transcribe_audio(ogg_path: str) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я вайб-бот с умным роутером 🤖\n\n"
+        "Привет! Я JadeBridge — бот с умным роутером 🤖\n\n"
         "Пиши вопросы — модель выберется автоматически.\n"
         "Или используй префикс:\n"
         "  • @claude — Sonnet для сложных задач\n"
