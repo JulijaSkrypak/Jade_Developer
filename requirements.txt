@@ -1,0 +1,21 @@
+# JadeBridge — зависимости проекта
+# Для установки на VPS: pip install -r requirements.txt
+
+# Telegram
+python-telegram-bot==20.3
+
+# HTTP-клиент (OpenRouter API)
+httpx>=0.24.1
+
+# Окружение
+python-dotenv>=1.0.0
+
+# Голос: Groq Whisper STT
+groq>=1.4.0
+
+# Документы
+pdfplumber>=0.11.0          # PDF
+python-docx>=1.1.0          # DOCX
+
+# Excel
+openpyxl>=3.1.0             # XLSX (Фаза 4.4)

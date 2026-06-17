@@ -11,6 +11,7 @@ import tempfile
 import subprocess
 import zipfile
 import shutil
+import math
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -18,6 +19,7 @@ import httpx
 from groq import Groq
 import pdfplumber
 import docx as python_docx
+import openpyxl
 
 load_dotenv()
 
@@ -207,7 +209,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  • @gemini — Flash для быстрых ответов\n\n"
         "Голосовые сообщения распознаю через Groq Whisper 🎙️\n"
         "Документы PDF, DOCX, TXT, MD, JSON — читаю и отвечаю по содержимому 📄\n"
-        "ZIP-архивы с документами внутри — тоже поддерживаю 📦"
+        "ZIP-архивы с документами внутри — тоже поддерживаю 📦\n"
+        "Excel таблицы .xlsx — анализирую, поддержка формул и нескольких листов 📊"
     )
 
 
@@ -236,7 +239,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обрабатывает текстовые сообщения со Smart Router.
     Голос и фото — в отдельных обработчиках, здесь не трогаются.
+    При активном xlsx-диалоге — перенаправляет ответ пользователя в handle_xlsx_dialog.
     """
+    # ── Перехват xlsx-диалога ────────────────────────────────────────────────
+    if context.user_data.get("xlsx_pending"):
+        await handle_xlsx_dialog(update, context)
+        return
+    # ────────────────────────────────────────────────────────────────────────
+
     user_id = update.effective_user.id
     raw_text = update.message.text
 
@@ -309,6 +319,12 @@ ZIP_SUPPORTED_EXTS = {".pdf", ".docx", ".txt", ".md", ".json"}
 
 # Системный мусор от macOS — игнорируем
 ZIP_IGNORE_PREFIXES = ("__MACOSX", ".DS_Store")
+
+# ── XLSX-лимиты ───────────────────────────────────────────────────────────────
+# ~10K токенов — оставляет запас для системного промпта, истории диалога и ответа модели.
+# Обоснование: claude-sonnet-4-6 имеет 200K контекст; xlsx таблица в 40K символов ≈ 10K токенов
+# — это 5% контекста, что разумно при наличии истории диалога.
+XLSX_MAX_CHARS = 40_000
 
 
 def extract_text_from_pdf(path: str) -> str:
@@ -462,10 +478,370 @@ def extract_text_from_zip(zip_path: str, archive_name: str) -> tuple[str, bool]:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# EXCEL (.xlsx)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sheet_to_markdown(ws) -> str:
+    """
+    Конвертирует лист openpyxl в Markdown-таблицу.
+
+    - Первая строка → заголовки (| Col1 | Col2 | ...)
+    - Вторая строка → разделитель (| --- | --- | ...)
+    - Остальные строки → данные
+    - Формулы с вычисленным значением → показываем значение
+    - Формулы без вычисленного значения (None) → "[формула, не вычислено]"
+    """
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return ""
+
+    def fmt_cell(val) -> str:
+        """Форматирует значение ячейки в строку."""
+        if val is None:
+            return ""
+        s = str(val)
+        # Если это формула (начинается с =) и значение None уже заменено пустой строкой
+        # выше — этот случай не сработает. Но если data_only=False случайно вернул формулу:
+        if s.startswith("="):
+            return f"[формула, не вычислено: {s}]"
+        # Экранируем | чтобы не сломать markdown-таблицу
+        return s.replace("|", "\\|")
+
+    def fmt_row(row_vals) -> str:
+        return "| " + " | ".join(fmt_cell(v) for v in row_vals) + " |"
+
+    header = rows[0]
+    col_count = len(header)
+
+    lines = []
+    lines.append(fmt_row(header))
+    lines.append("| " + " | ".join(["---"] * col_count) + " |")
+
+    for row in rows[1:]:
+        lines.append(fmt_row(row))
+
+    return "\n".join(lines)
+
+
+def _open_xlsx_data(path: str) -> dict:
+    """
+    Открывает .xlsx файл с data_only=True и читает все листы в память.
+    Возвращает словарь:
+    {
+        "sheet_names": [...],
+        "sheets": {
+            "SheetName": {
+                "markdown": "...",
+                "rows": N,
+                "cols": M,
+            },
+            ...
+        }
+    }
+    Вызывает исключение при повреждённом файле.
+    """
+    wb = openpyxl.load_workbook(path, data_only=True)
+    result = {"sheet_names": wb.sheetnames, "sheets": {}}
+
+    for name in wb.sheetnames:
+        try:
+            ws = wb[name]
+            rows_list = list(ws.iter_rows(values_only=True))
+            n_rows = max(0, len(rows_list) - 1)  # не считаем строку заголовков
+            n_cols = len(rows_list[0]) if rows_list else 0
+
+            # Проверяем наличие None-значений в формульных ячейках:
+            # openpyxl с data_only=True вернёт None если файл не был пересохранён
+            # через Excel/LibreOffice. В этом случае нужно открыть без data_only
+            # и взять саму формулу как fallback.
+            has_uncalculated = False
+            for row in rows_list:
+                for val in row:
+                    if val is None:
+                        # Может быть просто пустая ячейка — не паникуем
+                        pass
+
+            markdown = sheet_to_markdown(ws)
+
+            # Fallback: если формулы не вычислены (data_only=True вернул None)
+            # открываем ещё раз без data_only чтобы взять текст формул
+            wb2 = openpyxl.load_workbook(path, data_only=False)
+            ws2 = wb2[name]
+            rows2 = list(ws2.iter_rows(values_only=True))
+
+            # Если в data_only версии ячейка None, а в raw версии — формула
+            merged_rows = []
+            for r_idx, (row_d, row_r) in enumerate(zip(rows_list, rows2)):
+                merged = []
+                for v_data, v_raw in zip(row_d, row_r):
+                    if v_data is None and v_raw is not None and str(v_raw).startswith("="):
+                        # Формула не была вычислена
+                        merged.append(f"[формула, не вычислено: {v_raw}]")
+                        has_uncalculated = True
+                    else:
+                        merged.append(v_data)
+                merged_rows.append(tuple(merged))
+
+            if has_uncalculated:
+                # Пересчитываем markdown с fallback-значениями
+                import io
+                from openpyxl.worksheet.worksheet import Worksheet
+                # Создаём временный лист для форматирования через sheet_to_markdown
+                # путём прямой передачи строк
+                lines = []
+
+                def fmt_cell_merged(val) -> str:
+                    if val is None:
+                        return ""
+                    s = str(val)
+                    if s.startswith("="):
+                        return f"[формула, не вычислено: {s}]"
+                    return s.replace("|", "\\|")
+
+                def fmt_row_merged(row_vals) -> str:
+                    return "| " + " | ".join(fmt_cell_merged(v) for v in row_vals) + " |"
+
+                if merged_rows:
+                    header = merged_rows[0]
+                    col_count = len(header)
+                    lines.append(fmt_row_merged(header))
+                    lines.append("| " + " | ".join(["---"] * col_count) + " |")
+                    for row in merged_rows[1:]:
+                        lines.append(fmt_row_merged(row))
+                markdown = "\n".join(lines)
+
+            result["sheets"][name] = {
+                "markdown": markdown,
+                "rows": n_rows,
+                "cols": n_cols,
+            }
+
+        except Exception as sheet_err:
+            logger.warning(f"XLSX: ошибка чтения листа '{name}': {sheet_err}")
+            result["sheets"][name] = {
+                "markdown": f"[Ошибка чтения листа '{name}': {sheet_err}]",
+                "rows": 0,
+                "cols": 0,
+            }
+
+    return result
+
+
+def build_sheet_text(sheet_name: str, sheet_data: dict) -> str:
+    """
+    Формирует итоговый текст для одного листа, готовый к передаче в LLM.
+    Формат:
+        [Лист: «Название» | N строк × M столбцов]
+        | Col1 | Col2 | ...
+        | --- | --- | ...
+        | ... | ... | ...
+    """
+    return (
+        f"[Лист: «{sheet_name}» | {sheet_data['rows']} строк × {sheet_data['cols']} столбцов]\n"
+        f"{sheet_data['markdown']}"
+    )
+
+
+def split_text_into_parts(text: str, max_chars: int) -> list[str]:
+    """
+    Делит большой текст на части по max_chars символов,
+    стараясь разбивать по переносу строки (не рвать строки таблицы).
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    parts = []
+    lines = text.split("\n")
+    current = []
+    current_len = 0
+
+    for line in lines:
+        line_len = len(line) + 1  # +1 за \n
+        if current_len + line_len > max_chars and current:
+            parts.append("\n".join(current))
+            current = [line]
+            current_len = line_len
+        else:
+            current.append(line)
+            current_len += line_len
+
+    if current:
+        parts.append("\n".join(current))
+
+    return parts
+
+
+async def _process_xlsx_sheets(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    sheet_names: list[str],
+    xlsx_data: dict,
+    file_name: str,
+    caption: str,
+    user_id: int,
+) -> None:
+    """
+    Общая логика обработки выбранных листов xlsx:
+    - Строит текст, проверяет лимит, при необходимости запрашивает выбор усечения.
+    - Если данные в норме — сразу отправляет в LLM.
+    """
+    # Собираем текст для выбранных листов
+    parts_text = []
+    for name in sheet_names:
+        if name in xlsx_data["sheets"]:
+            parts_text.append(build_sheet_text(name, xlsx_data["sheets"][name]))
+
+    header = f"[Файл: {file_name} | Листы: {', '.join(sheet_names)}]\n"
+    combined = header + "\n\n".join(parts_text)
+
+    if len(combined) > XLSX_MAX_CHARS:
+        # Сохраняем состояние и спрашиваем пользователя
+        n_parts = math.ceil(len(combined) / XLSX_MAX_CHARS)
+        approx_rows_limit = sum(
+            xlsx_data["sheets"].get(n, {}).get("rows", 0) for n in sheet_names
+        )
+        rows_per_part = max(1, approx_rows_limit // n_parts)
+
+        context.user_data["xlsx_pending"] = {
+            "state": "awaiting_size_choice",
+            "file_name": file_name,
+            "sheet_names": sheet_names,
+            "xlsx_data": xlsx_data,
+            "combined_text": combined,
+            "caption": caption,
+            "user_id": user_id,
+            "n_parts": n_parts,
+            "rows_per_part": rows_per_part,
+        }
+        await update.message.reply_text(
+            f"⚠️ Таблица слишком большая ({len(combined):,} символов, лимит {XLSX_MAX_CHARS:,}).\n"
+            f"Примерно {n_parts} части.\n\n"
+            f"Что делать?\n"
+            f"1️⃣ — Обрезать: взять первые ~{XLSX_MAX_CHARS} символов\n"
+            f"2️⃣ — Прислать частями ({n_parts} сообщения)"
+        )
+        return
+
+    # Данные в норме — отправляем в LLM
+    await _send_xlsx_to_llm(update, context, combined, caption, user_id)
+
+
+async def _send_xlsx_to_llm(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    combined: str,
+    caption: str,
+    user_id: int,
+) -> None:
+    """Формирует промпт и отправляет данные xlsx в LLM через Smart Router."""
+    if caption.strip():
+        user_prompt = f"{combined}\n\n{caption.strip()}"
+    else:
+        user_prompt = (
+            f"{combined}\n\n"
+            "[Системный запрос: пользователь прислал таблицу без конкретного вопроса. "
+            "Кратко резюмируй содержимое: о чём таблица, ключевые данные, структура.]"
+        )
+
+    model, clean_prompt, notification = await choose_model(user_prompt)
+    if notification:
+        await update.message.reply_text(notification)
+    else:
+        await update.message.reply_text("Думаю... 🤔")
+
+    reply = await ask_llm(user_id, clean_prompt, model)
+    await update.message.reply_text(reply)
+
+
+async def handle_xlsx_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обрабатывает ответы пользователя в диалоге xlsx (выбор листа / усечение).
+    Вызывается из handle_text когда context.user_data['xlsx_pending'] существует.
+    """
+    pending = context.user_data.get("xlsx_pending", {})
+    state = pending.get("state")
+    user_text = update.message.text.strip().lower()
+
+    if state == "awaiting_sheet_choice":
+        sheet_names_all: list[str] = pending["sheet_names_all"]
+        file_name: str = pending["file_name"]
+        xlsx_data: dict = pending["xlsx_data"]
+        caption: str = pending["caption"]
+        user_id: int = pending["user_id"]
+
+        chosen_sheets: list[str] = []
+
+        if user_text in ("все", "all", "0"):
+            chosen_sheets = sheet_names_all
+        else:
+            # Парсим номера: "1", "1 2", "1,2", "1, 3"
+            import re
+            numbers = re.findall(r"\d+", user_text)
+            for n_str in numbers:
+                idx = int(n_str) - 1
+                if 0 <= idx < len(sheet_names_all):
+                    name = sheet_names_all[idx]
+                    if name not in chosen_sheets:
+                        chosen_sheets.append(name)
+
+        if not chosen_sheets:
+            sheets_list = "\n".join(
+                f"{i+1}. {name}" for i, name in enumerate(sheet_names_all)
+            )
+            await update.message.reply_text(
+                f"❓ Не понял выбор. Пожалуйста, введи номер листа (1–{len(sheet_names_all)}) "
+                f"или напиши «все».\n\nДоступные листы:\n{sheets_list}"
+            )
+            return
+
+        # Очищаем ожидание — обработаем листы (возможно войдём в диалог размера)
+        del context.user_data["xlsx_pending"]
+        await update.message.reply_text(f"📊 Обрабатываю лист(ы): {', '.join(chosen_sheets)}...")
+        await _process_xlsx_sheets(update, context, chosen_sheets, xlsx_data, file_name, caption, user_id)
+
+    elif state == "awaiting_size_choice":
+        file_name: str = pending["file_name"]
+        sheet_names: list[str] = pending["sheet_names"]
+        xlsx_data: dict = pending["xlsx_data"]
+        combined: str = pending["combined_text"]
+        caption: str = pending["caption"]
+        user_id: int = pending["user_id"]
+        n_parts: int = pending["n_parts"]
+
+        del context.user_data["xlsx_pending"]
+
+        if user_text in ("1", "обрезать", "обрезать"):
+            truncated = combined[:XLSX_MAX_CHARS]
+            truncated += "\n\n[текст таблицы обрезан до первых символов по лимиту]"
+            await update.message.reply_text("✂️ Беру первые данные...")
+            await _send_xlsx_to_llm(update, context, truncated, caption, user_id)
+
+        elif user_text in ("2", "частями", "частями"):
+            text_parts = split_text_into_parts(combined, XLSX_MAX_CHARS)
+            await update.message.reply_text(f"📨 Отправляю {len(text_parts)} части...")
+            for i, part in enumerate(text_parts, 1):
+                part_text = f"[Часть {i} из {len(text_parts)}]\n{part}"
+                await _send_xlsx_to_llm(update, context, part_text, caption if i == 1 else "", user_id)
+        else:
+            n_parts = pending.get("n_parts", 2)
+            context.user_data["xlsx_pending"] = pending  # восстанавливаем
+            await update.message.reply_text(
+                "❓ Не понял. Введи 1️⃣ (обрезать) или 2️⃣ (частями)."
+            )
+    else:
+        # Неизвестное состояние — очищаем
+        context.user_data.pop("xlsx_pending", None)
+        await update.message.reply_text(
+            "⚠️ Сессия обработки xlsx устарела. Пожалуйста, пришли файл заново."
+        )
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Обрабатывает документы PDF и DOCX.
+    Обрабатывает документы: PDF, DOCX, TXT, MD, JSON, ZIP, XLSX.
     Извлекает текст → подмешивает в историю → отдаёт в Smart Router.
+    Для XLSX: при нескольких листах запускает диалог с пользователем.
     """
     user_id = update.effective_user.id
     document = update.message.document
@@ -482,16 +858,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Проверка расширения
     ext = os.path.splitext(file_name)[1].lower()
-    if ext not in (".pdf", ".docx", ".txt", ".md", ".json", ".zip"):
+    if ext not in (".pdf", ".docx", ".txt", ".md", ".json", ".zip", ".xlsx"):
         await update.message.reply_text(
             f"⚠️ Формат {ext or 'неизвестный'} пока не поддерживается.\n"
-            "Поддерживаю: PDF (.pdf), Word (.docx), текст (.txt, .md), JSON (.json), архивы (.zip).\n"
-            "Excel, RAR и другие форматы — не поддерживаются 🚧"
+            "Поддерживаю: PDF (.pdf), Word (.docx), текст (.txt, .md), JSON (.json), "
+            "архивы (.zip), Excel (.xlsx).\n"
+            "RAR и другие форматы — не поддерживаются 🚧"
         )
         return
 
     if ext == ".zip":
         await update.message.reply_text(f"📦 Получил архив «{file_name}», распаковываю...")
+    elif ext == ".xlsx":
+        await update.message.reply_text(f"📊 Получил таблицу «{file_name}», читаю...")
     else:
         await update.message.reply_text(f"📄 Получил документ «{file_name}», читаю...")
 
@@ -504,7 +883,54 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tg_file.download_to_drive(tmp_path)
 
         # Извлекаем текст
-        if ext == ".zip":
+        if ext == ".xlsx":
+            # ── XLSX: читаем все листы в память сразу, tmp файл больше не нужен ──
+            try:
+                xlsx_data = _open_xlsx_data(tmp_path)
+            except Exception as xlsx_err:
+                logger.error(f"XLSX: не удалось открыть файл '{file_name}': {xlsx_err}")
+                await update.message.reply_text(
+                    f"❌ Не удалось открыть файл Excel.\n"
+                    f"Возможно, файл повреждён или не является корректным .xlsx файлом.\n"
+                    f"Ошибка: {xlsx_err}"
+                )
+                return
+
+            sheet_names = xlsx_data["sheet_names"]
+
+            if len(sheet_names) == 0:
+                await update.message.reply_text(
+                    "⚠️ В файле нет листов. Возможно, файл пустой или повреждён."
+                )
+                return
+
+            if len(sheet_names) == 1:
+                # Один лист — обрабатываем сразу без диалога
+                await _process_xlsx_sheets(
+                    update, context, sheet_names, xlsx_data, file_name, caption, user_id
+                )
+            else:
+                # Несколько листов — запускаем диалог
+                sheets_list = "\n".join(
+                    f"{i+1}. {name}" for i, name in enumerate(sheet_names)
+                )
+                context.user_data["xlsx_pending"] = {
+                    "state": "awaiting_sheet_choice",
+                    "file_name": file_name,
+                    "sheet_names_all": sheet_names,
+                    "xlsx_data": xlsx_data,
+                    "caption": caption,
+                    "user_id": user_id,
+                }
+                await update.message.reply_text(
+                    f"📋 Файл «{file_name}» содержит {len(sheet_names)} листа(ов):\n"
+                    f"{sheets_list}\n\n"
+                    f"Напиши номер листа (1–{len(sheet_names)}), несколько через запятую, "
+                    f"или напиши «все» для обработки всех листов."
+                )
+            return  # xlsx обработан (или запущен диалог) — дальше не идём
+
+        elif ext == ".zip":
             try:
                 raw_text, limits_exceeded = extract_text_from_zip(tmp_path, file_name)
             except zipfile.BadZipFile:
@@ -602,5 +1028,8 @@ app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 if __name__ == "__main__":
-    logger.info("Bot started with Smart Router (choose_model) + Groq Whisper STT + PDF/DOCX/TXT/MD/JSON/ZIP support")
+    logger.info(
+        "Bot started with Smart Router (choose_model) + Groq Whisper STT "
+        "+ PDF/DOCX/TXT/MD/JSON/ZIP/XLSX support"
+    )
     app.run_polling()
