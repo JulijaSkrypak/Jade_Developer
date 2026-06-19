@@ -585,7 +585,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_type="video",
                 file_name=video.file_name or "video.mp4",
             )
-        await update.message.reply_text("✅ Видео архивировано в топик Images.")
+        await update.message.reply_text("Файл адресован в: IMAGES.")
     finally:
         await delete_messages_safely(context.bot, chat_id, status_msg_ids)
 
@@ -1358,7 +1358,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"[topic_router] Не удалось переслать GIF-документ в топик: {_fwd_err}")
             
             await delete_messages_safely(context.bot, chat_id, status_msg_ids)
-            await update.message.reply_text("✅ GIF-документ успешно переслан в топик Images.")
+            await update.message.reply_text("Файл адресован в: IMAGES.")
             return
 
         elif ext == ".zip":
@@ -1592,7 +1592,7 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_name="video_note.mp4",
             )
 
-        await update.message.reply_text("✅ Видеокружочек успешно переслан в топик Images.")
+        await update.message.reply_text("Файл адресован в: IMAGES.")
     except Exception as e:
         logger.error(f"handle_video_note error: {e}")
         await update.message.reply_text(f"❌ Не удалось обработать видеокружочек: {e}")
@@ -1633,7 +1633,7 @@ async def handle_animation(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_name=animation.file_name or "animation.gif",
             )
 
-        await update.message.reply_text("✅ GIF-анимация успешно переслана в топик Images.")
+        await update.message.reply_text("Файл адресован в: IMAGES.")
     except Exception as e:
         logger.error(f"handle_animation error: {e}")
         await update.message.reply_text(f"❌ Не удалось обработать анимацию: {e}")
