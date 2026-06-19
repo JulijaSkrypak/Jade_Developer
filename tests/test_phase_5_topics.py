@@ -19,7 +19,7 @@ import zipfile
 import importlib
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, mock_open
 
 import pytest
 
@@ -817,6 +817,195 @@ class TestCorruptedPdfHandling(unittest.IsolatedAsyncioTestCase):
             mock_update.message.reply_text.assert_any_call(
                 "⚠️ Не удалось извлечь текст из документа.\nВозможно, это отсканированный PDF без распознанного текста."
             )
+
+
+class TestStatusMessageDeletionAndPrefixes(unittest.IsolatedAsyncioTestCase):
+    """Тесты для проверки удаления промежуточных статусных сообщений и добавления префиксов в ответы."""
+
+    def setUp(self):
+        # Настраиваем mock для bot и update
+        self.bot = MagicMock()
+        self.bot.delete_message = AsyncMock()
+
+        self.mock_update = MagicMock()
+        self.mock_update.effective_chat.id = 9999
+        self.mock_update.effective_chat.type = "private"
+        self.mock_update.effective_user.id = 8888
+        self.mock_update.effective_user.is_bot = False
+        
+        self.mock_msg = MagicMock()
+        self.mock_msg.message_id = 123
+        self.mock_update.message = self.mock_msg
+        
+        # Переопределяем reply_text, чтобы он возвращал объект сообщения с нужным id
+        self.sent_messages = []
+        async def mock_reply_text(text, *args, **kwargs):
+            msg = MagicMock()
+            msg.message_id = len(self.sent_messages) + 1000
+            self.sent_messages.append((msg.message_id, text))
+            return msg
+        self.mock_msg.reply_text = AsyncMock(side_effect=mock_reply_text)
+
+        self.context = MagicMock()
+        self.context.bot = self.bot
+        self.context.user_data = {}
+
+    @patch("bot.ask_llm", new_callable=AsyncMock, return_value="Анализ ответа LLM")
+    @patch("bot.transcribe_audio", new_callable=AsyncMock, return_value="Тестовая речь")
+    @patch("bot.forward_to_topic", new_callable=AsyncMock)
+    @patch("bot.tempfile.NamedTemporaryFile")
+    @patch("bot.os.remove")
+    async def test_handle_voice_status_deletion_and_prefix(self, mock_remove, mock_temp, mock_forward, mock_transcribe, mock_ask):
+        # Настраиваем временный файл
+        mock_file = MagicMock()
+        mock_file.name = "temp.ogg"
+        mock_temp.return_value.__enter__.return_value = mock_file
+        
+        self.context.bot.get_file = AsyncMock()
+
+        from bot import handle_voice
+        await handle_voice(self.mock_update, self.context)
+
+        # Проверяем, что промежуточные сообщения "Распознаю..." и "Обрабатываю запрос..." удалялись
+        self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1000) # Распознаю...
+        self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1001) # Обрабатываю запрос...
+
+        # Проверяем, что окончательный ответ содержит префикс 🎙️ и распознанный текст
+        self.mock_msg.reply_text.assert_any_call("🎙️ Тестовая речь\n\nАнализ ответа LLM")
+
+    @patch("bot.httpx.AsyncClient")
+    @patch("bot.forward_to_topic", new_callable=AsyncMock)
+    @patch("bot.tempfile.NamedTemporaryFile")
+    @patch("bot.os.remove")
+    @patch("builtins.open", new_callable=mock_open, read_data=b"fake jpeg data")
+    async def test_handle_photo_status_deletion_and_prefix(self, mock_file_open, mock_remove, mock_temp, mock_forward, mock_client_class):
+        # Настраиваем mock для скачивания файла
+        self.context.bot.get_file = AsyncMock()
+        mock_file = MagicMock()
+        mock_file.name = "temp.jpg"
+        mock_temp.return_value.__enter__.return_value = mock_file
+
+        # Настраиваем mock для httpx post
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json = lambda: {
+            "choices": [{"message": {"content": "Анализ картинки"}}]
+        }
+        
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client_class.return_value.__aenter__.return_value = mock_client
+
+        self.mock_msg.photo = [MagicMock()]
+        self.mock_msg.caption = "Что на фото?"
+
+        from bot import handle_photo
+        await handle_photo(self.mock_update, self.context)
+
+        # Проверяем удаление статуса "Анализирую фото..."
+        self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1000)
+
+        # Проверяем окончательный ответ с префиксом 🖼️
+        self.mock_msg.reply_text.assert_any_call("🖼️ Что на фото?\n\nАнализ картинки")
+
+    @patch("bot.forward_to_topic", new_callable=AsyncMock)
+    async def test_handle_video_status_deletion(self, mock_forward):
+        self.mock_msg.video = MagicMock()
+
+        from bot import handle_video
+        await handle_video(self.mock_update, self.context)
+
+        # Проверяем удаление статуса "Видео получено..."
+        self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1000)
+
+    @patch("bot.ask_llm", new_callable=AsyncMock, return_value="Анализ документа")
+    @patch("bot.choose_model", new_callable=AsyncMock, return_value=("google/gemini-3.5-flash", "clean prompt", ""))
+    @patch("bot.extract_text_from_plain", return_value="Содержимое текстового файла")
+    @patch("bot.forward_to_topic", new_callable=AsyncMock)
+    @patch("bot.tempfile.NamedTemporaryFile")
+    @patch("bot.os.remove")
+    async def test_handle_document_plain_text_status_deletion_and_prefix(self, mock_remove, mock_temp, mock_forward, mock_extract, mock_choose, mock_ask):
+        self.context.bot.get_file = AsyncMock()
+        mock_file = MagicMock()
+        mock_file.name = "temp.txt"
+        mock_temp.return_value.__enter__.return_value = mock_file
+
+        self.mock_msg.document = MagicMock()
+        self.mock_msg.document.file_name = "test.txt"
+        self.mock_msg.document.file_size = 500
+        self.mock_msg.document.file_id = "txt_file_id"
+        self.mock_msg.caption = ""
+
+        from bot import handle_document
+        await handle_document(self.mock_update, self.context)
+
+        # Проверяем удаление статусов "Анализирую документ..." и "Обрабатываю запрос..."
+        self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1000)
+        self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1001)
+
+        # Проверяем окончательный ответ с префиксом 📄
+        self.mock_msg.reply_text.assert_any_call("📄 [Документ: test.txt]\n\nСодержимое текстового файла\n\nАнализ документа")
+
+
+class TestShouldProcessMessage(unittest.TestCase):
+    """Тесты для проверки логики фильтрации should_process_message в bot.py."""
+
+    def setUp(self):
+        import importlib
+        import os
+        os.environ["SUPERGROUP_ID"] = "-1004295196278"
+        import topic_router
+        importlib.reload(topic_router)
+        import bot
+        importlib.reload(bot)
+        self.bot = bot
+
+    def _make_mock_update(self, chat_id, chat_type, is_bot, thread_id=None):
+        mock_update = MagicMock()
+        mock_update.effective_chat = MagicMock()
+        mock_update.effective_chat.id = chat_id
+        mock_update.effective_chat.type = chat_type
+        
+        mock_update.effective_user = MagicMock()
+        mock_update.effective_user.is_bot = is_bot
+        mock_update.effective_user.name = "@test_user"
+        mock_update.effective_user.id = 123456
+        
+        mock_update.message = MagicMock()
+        mock_update.message.message_thread_id = thread_id
+        mock_update.message.text = "Hello bot"
+        mock_update.message.caption = None
+        return mock_update
+
+    def test_private_chat_allowed_for_users(self):
+        """Сообщение от пользователя в приватном чате разрешено."""
+        update = self._make_mock_update(chat_id=123, chat_type="private", is_bot=False)
+        self.assertTrue(self.bot.should_process_message(update))
+
+    def test_private_chat_ignored_for_bots(self):
+        """Сообщение от бота в приватном чате игнорируется."""
+        update = self._make_mock_update(chat_id=123, chat_type="private", is_bot=True)
+        self.assertFalse(self.bot.should_process_message(update))
+
+    def test_supergroup_general_topic_allowed_for_users(self):
+        """Сообщение в топике General (thread_id is None) разрешено для пользователей."""
+        update = self._make_mock_update(chat_id=-1004295196278, chat_type="supergroup", is_bot=False, thread_id=None)
+        self.assertTrue(self.bot.should_process_message(update))
+
+    def test_supergroup_general_topic_ignored_for_bots(self):
+        """Сообщение в топике General игнорируется для ботов."""
+        update = self._make_mock_update(chat_id=-1004295196278, chat_type="supergroup", is_bot=True, thread_id=None)
+        self.assertFalse(self.bot.should_process_message(update))
+
+    def test_supergroup_other_topic_ignored_for_users(self):
+        """Сообщение в других топиках (thread_id is not None) игнорируется."""
+        update = self._make_mock_update(chat_id=-1004295196278, chat_type="supergroup", is_bot=False, thread_id=118)
+        self.assertFalse(self.bot.should_process_message(update))
+
+    def test_other_group_ignored_entirely(self):
+        """Сообщения из посторонних групп/супергрупп игнорируются."""
+        update = self._make_mock_update(chat_id=-1001111111111, chat_type="supergroup", is_bot=False, thread_id=None)
+        self.assertFalse(self.bot.should_process_message(update))
 
 
 if __name__ == "__main__":

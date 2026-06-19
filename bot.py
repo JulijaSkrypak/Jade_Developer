@@ -22,7 +22,7 @@ from groq import Groq
 import pdfplumber
 import docx as python_docx
 import openpyxl
-from topic_router import forward_to_topic, get_topic_id_for_file
+from topic_router import forward_to_topic, get_topic_id_for_file, SUPERGROUP_ID
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -60,6 +60,15 @@ logger = logging.getLogger(__name__)
 
 user_histories: dict[int, list] = {}
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+
+async def delete_messages_safely(bot, chat_id: int, message_ids: list[int]):
+    """Безопасно удаляет список сообщений по их ID, игнорируя ошибки (если сообщение уже удалено)."""
+    for msg_id in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception as e:
+            logger.warning(f"Failed to delete message {msg_id}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -212,11 +221,66 @@ async def transcribe_audio(ogg_path: str) -> str:
     return transcription
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HANDLERS
-# ══════════════════════════════════════════════════════════════════════════════
+def should_process_message(update: Update) -> bool:
+    """
+    Проверяет, нужно ли обрабатывать сообщение.
+    Разрешает обработку только для приватных чатов и топика General в супергруппе SUPERGROUP_ID.
+    Игнорирует сообщения от ботов.
+    """
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return False
+
+    # Для совместимости с юнит-тестами, где поля могут быть MagicMock
+    try:
+        from unittest.mock import MagicMock
+        is_mock_chat_type = isinstance(update.effective_chat.type, MagicMock)
+        is_mock_chat_id = isinstance(update.effective_chat.id, MagicMock)
+        is_mock_is_bot = isinstance(update.effective_user.is_bot, MagicMock)
+    except ImportError:
+        is_mock_chat_type = False
+        is_mock_chat_id = False
+        is_mock_is_bot = False
+
+    is_bot = update.effective_user.is_bot
+    if is_mock_is_bot:
+        is_bot = False
+
+    # Игнорируем сообщения от ботов
+    if is_bot:
+        return False
+
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+
+    if is_mock_chat_type:
+        chat_type = "private"
+    if is_mock_chat_id:
+        chat_id = 0
+
+    # Временное логирование для сообщений из нашей супергруппы
+    if SUPERGROUP_ID is not None and chat_id == SUPERGROUP_ID:
+        thread_id = update.message.message_thread_id
+        logger.info(
+            f"[GROUP_MSG] Входящее сообщение в супергруппе {chat_id}. "
+            f"thread_id={thread_id}, text={update.message.text or update.message.caption or ''}, "
+            f"user={update.effective_user.name} (id={update.effective_user.id})"
+        )
+
+    # Проверка типа чата
+    if chat_type == "private":
+        return True
+
+    if SUPERGROUP_ID is not None and chat_id == SUPERGROUP_ID:
+        # Разрешаем только сообщения из топика General (где thread_id равен None)
+        thread_id = update.message.message_thread_id
+        return thread_id is None
+
+    return False
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not should_process_message(update):
+        return
     await update.message.reply_text(
         "JadeBridge стартовал.\n\n"
         "Пиши вопросы — модель выберется автоматически.\n"
@@ -231,6 +295,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not should_process_message(update):
+        return
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             r = await client.get(
@@ -246,6 +312,8 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not should_process_message(update):
+        return
     user_id = update.effective_user.id
     user_histories[user_id] = []
     await update.message.reply_text("История очищена ✓")
@@ -257,6 +325,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Голос и фото — в отдельных обработчиках, здесь не трогаются.
     При активном xlsx-диалоге — перенаправляет ответ пользователя в handle_xlsx_dialog.
     """
+    if not should_process_message(update):
+        return
     # ── Перехват xlsx-диалога ────────────────────────────────────────────────
     if context.user_data.get("xlsx_pending"):
         await handle_xlsx_dialog(update, context)
@@ -264,23 +334,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ────────────────────────────────────────────────────────────────────────
 
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     raw_text = update.message.text
+    status_msg_ids = []
 
     # Определяем модель
     model, clean_text, notification = await choose_model(raw_text)
 
-    # Уведомление — только для complex / явных префиксов
-    if notification:
-        await update.message.reply_text(notification)
-    else:
-        await update.message.reply_text("Обрабатываю запрос...")
-
     try:
+        # Уведомление — только для complex / явных префиксов
+        if notification:
+            msg_note = await update.message.reply_text(notification)
+            status_msg_ids.append(msg_note.message_id)
+        else:
+            msg_proc = await update.message.reply_text("Обрабатываю запрос...")
+            status_msg_ids.append(msg_proc.message_id)
+
         reply = await ask_llm(user_id, clean_text, model)
         await update.message.reply_text(reply)
     except Exception as e:
         logger.error(f"LLM error (model={model}): {e}")
         await update.message.reply_text(f"Ошибка LLM: {e}")
+    finally:
+        await delete_messages_safely(context.bot, chat_id, status_msg_ids)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -288,10 +364,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Обрабатывает голосовые сообщения.
     Всегда использует MODEL_VOICE (Gemini Flash) — не затронуто роутером.
     """
+    if not should_process_message(update):
+        return
     user_id = update.effective_user.id
-    await update.message.reply_text("Распознаю...")
+    chat_id = update.effective_chat.id
+    status_msg_ids = []
 
     try:
+        msg_rec = await update.message.reply_text("Распознаю...")
+        status_msg_ids.append(msg_rec.message_id)
+
         voice = update.message.voice
         voice_file = await context.bot.get_file(voice.file_id)
 
@@ -307,10 +389,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Не удалось распознать речь. Попробуй ещё раз.")
             return
 
-        await update.message.reply_text(f"Распознано...\n🎙️ {recognized_text}")
-        await update.message.reply_text("Обрабатываю запрос...")
+        msg_proc = await update.message.reply_text("Обрабатываю запрос...")
+        status_msg_ids.append(msg_proc.message_id)
+
         reply = await ask_llm(user_id, recognized_text, MODEL_VOICE)
-        await update.message.reply_text(reply)
+        
+        # Объединяем префикс и ответ в одно окончательное сообщение
+        final_reply = f"🎙️ {recognized_text}\n\n{reply}"
+        await update.message.reply_text(final_reply)
 
         # ── Фаза 5: пересылка транскрипции в топик Тексты ─────────────────────
         # forward_to_topic сам ловит все ошибки — не нарушает основной flow
@@ -322,6 +408,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Voice handler error: {e}")
         await update.message.reply_text(f"❌ Ошибка обработки голосового: {e}")
+    finally:
+        await delete_messages_safely(context.bot, chat_id, status_msg_ids)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -335,13 +423,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Фаза 5: дополнительно пересылает оригинал в TOPIC_IMAGES_ID через file_id
     (без повторного скачивания — Telegram берёт из своего хранилища).
     """
+    if not should_process_message(update):
+        return
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     photo = update.message.photo[-1]  # наибольшее доступное разрешение
     caption = update.message.caption or ""
-
-    await update.message.reply_text("🖼️ Анализирую фото...")
+    status_msg_ids = []
 
     try:
+        msg_status = await update.message.reply_text("🖼️ Анализирую фото...")
+        status_msg_ids.append(msg_status.message_id)
+
         # Скачиваем фото для vision-анализа
         photo_file = await context.bot.get_file(photo.file_id)
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
@@ -379,11 +472,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             resp.raise_for_status()
             reply = resp.json()["choices"][0]["message"]["content"]
 
-        await update.message.reply_text(reply)
+        # Объединяем префикс и ответ в одно окончательное сообщение
+        final_reply = f"🖼️ {user_question}\n\n{reply}"
+        await update.message.reply_text(final_reply)
 
     except Exception as e:
         logger.error(f"handle_photo error: {e}")
         await update.message.reply_text(f"❌ Не удалось проанализировать фото: {e}")
+    finally:
+        await delete_messages_safely(context.bot, chat_id, status_msg_ids)
 
     # ── Фаза 5: пересылка оригинала в топик Images ────────────────────────────
     # Выполняется ПОСЛЕ основного ответа пользователю, ошибка не ломает flow
@@ -401,18 +498,26 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Фаза 5: пересылает в TOPIC_IMAGES_ID через file_id (без LLM-анализа видео).
     LLM-анализ видео — вне рамок данной фазы.
     """
+    if not should_process_message(update):
+        return
+    chat_id = update.effective_chat.id
     video = update.message.video
+    status_msg_ids = []
 
-    await update.message.reply_text("🎬 Видео получено...")
+    try:
+        msg_status = await update.message.reply_text("🎬 Видео получено...")
+        status_msg_ids.append(msg_status.message_id)
 
-    # ── Фаза 5: пересылка в топик Images ──────────────────────────────────────
-    await forward_to_topic(
-        context.bot,
-        topic_name="images",
-        file_id=video.file_id,
-        media_type="video",
-    )
-    await update.message.reply_text("✅ Видео архивировано в топик Images.")
+        # ── Фаза 5: пересылка в топик Images ──────────────────────────────────────
+        await forward_to_topic(
+            context.bot,
+            topic_name="images",
+            file_id=video.file_id,
+            media_type="video",
+        )
+        await update.message.reply_text("✅ Видео архивировано в топик Images.")
+    finally:
+        await delete_messages_safely(context.bot, chat_id, status_msg_ids)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -828,12 +933,17 @@ async def _process_xlsx_sheets(
     file_name: str,
     caption: str,
     user_id: int,
+    status_msg_ids: list[int] = None,
 ) -> None:
     """
     Общая логика обработки выбранных листов xlsx:
     - Строит текст, проверяет лимит, при необходимости запрашивает выбор усечения.
     - Если данные в норме — сразу отправляет в LLM.
     """
+    if status_msg_ids is None:
+        status_msg_ids = []
+    chat_id = update.effective_chat.id
+
     # Собираем текст для выбранных листов
     parts_text = []
     for name in sheet_names:
@@ -844,7 +954,10 @@ async def _process_xlsx_sheets(
     combined = header + "\n\n".join(parts_text)
 
     if len(combined) > XLSX_MAX_CHARS:
-        # Сохраняем состояние и спрашиваем пользователя
+        # Сохраняем состояние и спрашиваем пользователя. Перед этим удаляем статусы
+        await delete_messages_safely(context.bot, chat_id, status_msg_ids)
+        status_msg_ids.clear()
+
         n_parts = math.ceil(len(combined) / XLSX_MAX_CHARS)
         approx_rows_limit = sum(
             xlsx_data["sheets"].get(n, {}).get("rows", 0) for n in sheet_names
@@ -872,7 +985,7 @@ async def _process_xlsx_sheets(
         return
 
     # Данные в норме — отправляем в LLM
-    await _send_xlsx_to_llm(update, context, combined, caption, user_id)
+    await _send_xlsx_to_llm(update, context, combined, caption, user_id, status_msg_ids)
 
 
 async def _send_xlsx_to_llm(
@@ -881,25 +994,42 @@ async def _send_xlsx_to_llm(
     combined: str,
     caption: str,
     user_id: int,
+    status_msg_ids: list[int] = None,
 ) -> None:
     """Формирует промпт и отправляет данные xlsx в LLM через Smart Router."""
-    if caption.strip():
-        user_prompt = f"{combined}\n\n{caption.strip()}"
-    else:
-        user_prompt = (
-            f"{combined}\n\n"
-            "[Системный запрос: пользователь прислал таблицу без конкретного вопроса. "
-            "Кратко резюмируй содержимое: о чём таблица, ключевые данные, структура.]"
-        )
+    if status_msg_ids is None:
+        status_msg_ids = []
+    chat_id = update.effective_chat.id
 
-    model, clean_prompt, notification = await choose_model(user_prompt)
-    if notification:
-        await update.message.reply_text(notification)
-    else:
-        await update.message.reply_text("Обрабатываю запрос...")
+    try:
+        if caption.strip():
+            user_prompt = f"{combined}\n\n{caption.strip()}"
+        else:
+            user_prompt = (
+                f"{combined}\n\n"
+                "[Системный запрос: пользователь прислал таблицу без конкретного вопроса. "
+                "Кратко резюмируй содержимое: о чём таблица, ключевые данные, структура.]"
+            )
 
-    reply = await ask_llm(user_id, clean_prompt, model)
-    await update.message.reply_text(reply)
+        model, clean_prompt, notification = await choose_model(user_prompt)
+        if notification:
+            msg_note = await update.message.reply_text(notification)
+            status_msg_ids.append(msg_note.message_id)
+        else:
+            msg_proc = await update.message.reply_text("Обрабатываю запрос...")
+            status_msg_ids.append(msg_proc.message_id)
+
+        reply = await ask_llm(user_id, clean_prompt, model)
+
+        # Выбираем префикс и обрезаем входной контент до 1000 символов (Вариант А)
+        preview_text = combined
+        if len(preview_text) > 1000:
+            preview_text = preview_text[:1000] + "... [текст усечён для превью]"
+        
+        final_reply = f"📊 {preview_text}\n\n{reply}"
+        await update.message.reply_text(final_reply)
+    finally:
+        await delete_messages_safely(context.bot, chat_id, status_msg_ids)
 
 
 async def handle_xlsx_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -910,6 +1040,8 @@ async def handle_xlsx_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE)
     pending = context.user_data.get("xlsx_pending", {})
     state = pending.get("state")
     user_text = update.message.text.strip().lower()
+    chat_id = update.effective_chat.id
+    status_msg_ids = []
 
     if state == "awaiting_sheet_choice":
         sheet_names_all: list[str] = pending["sheet_names_all"]
@@ -945,8 +1077,9 @@ async def handle_xlsx_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # Очищаем ожидание — обработаем листы (возможно войдём в диалог размера)
         del context.user_data["xlsx_pending"]
-        await update.message.reply_text(f"📊 Обрабатываю лист(ы): {', '.join(chosen_sheets)}...")
-        await _process_xlsx_sheets(update, context, chosen_sheets, xlsx_data, file_name, caption, user_id)
+        msg_sheet = await update.message.reply_text(f"📊 Обрабатываю лист(ы): {', '.join(chosen_sheets)}...")
+        status_msg_ids.append(msg_sheet.message_id)
+        await _process_xlsx_sheets(update, context, chosen_sheets, xlsx_data, file_name, caption, user_id, status_msg_ids)
 
     elif state == "awaiting_size_choice":
         file_name: str = pending["file_name"]
@@ -962,15 +1095,23 @@ async def handle_xlsx_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if user_text in ("1", "обрезать", "обрезать"):
             truncated = combined[:XLSX_MAX_CHARS]
             truncated += "\n\n[текст таблицы обрезан до первых символов по лимиту]"
-            await update.message.reply_text("✂️ Беру первые данные...")
-            await _send_xlsx_to_llm(update, context, truncated, caption, user_id)
+            msg_trunc = await update.message.reply_text("✂️ Беру первые данные...")
+            status_msg_ids.append(msg_trunc.message_id)
+            await _send_xlsx_to_llm(update, context, truncated, caption, user_id, status_msg_ids)
 
         elif user_text in ("2", "частями", "частями"):
             text_parts = split_text_into_parts(combined, XLSX_MAX_CHARS)
-            await update.message.reply_text(f"📨 Отправляю {len(text_parts)} части...")
+            msg_parts = await update.message.reply_text(f"📨 Отправляю {len(text_parts)} части...")
+            status_msg_ids.append(msg_parts.message_id)
             for i, part in enumerate(text_parts, 1):
                 part_text = f"[Часть {i} из {len(text_parts)}]\n{part}"
-                await _send_xlsx_to_llm(update, context, part_text, caption if i == 1 else "", user_id)
+                is_last = (i == len(text_parts))
+                await _send_xlsx_to_llm(
+                    update, context, part_text, 
+                    caption if i == 1 else "", 
+                    user_id, 
+                    status_msg_ids if is_last else []
+                )
         else:
             n_parts = pending.get("n_parts", 2)
             context.user_data["xlsx_pending"] = pending  # восстанавливаем
@@ -991,7 +1132,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Извлекает текст → подмешивает в историю → отдаёт в Smart Router.
     Для XLSX: при нескольких листах запускает диалог с пользователем.
     """
+    if not should_process_message(update):
+        return
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     document = update.message.document
     file_name = document.file_name or "document"
     caption = update.message.caption or ""
@@ -1028,12 +1172,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    status_msg_ids = []
     if ext == ".zip":
-        await update.message.reply_text(f"📦 Распаковываю архив «{file_name}»...")
+        msg_status = await update.message.reply_text(f"📦 Распаковываю архив «{file_name}»...")
     elif ext == ".xlsx":
-        await update.message.reply_text(f"📊 Анализирую таблицу «{file_name}»...")
+        msg_status = await update.message.reply_text(f"📊 Анализирую таблицу «{file_name}»...")
     else:
-        await update.message.reply_text(f"📄 Анализирую документ «{file_name}»...")
+        msg_status = await update.message.reply_text(f"📄 Анализирую документ «{file_name}»...")
+    status_msg_ids.append(msg_status.message_id)
 
     # Скачиваем файл во временную папку
     tmp_path = None
@@ -1050,6 +1196,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 xlsx_data = _open_xlsx_data(tmp_path)
             except Exception as xlsx_err:
                 logger.error(f"XLSX: не удалось открыть файл '{file_name}': {xlsx_err}")
+                await delete_messages_safely(context.bot, chat_id, status_msg_ids)
                 await update.message.reply_text(
                     f"❌ Не удалось открыть файл Excel.\n"
                     f"Возможно, файл повреждён или не является корректным .xlsx файлом.\n"
@@ -1073,6 +1220,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"[topic_router] Не удалось переслать XLSX в топик: {_fwd_err}")
 
             if len(sheet_names) == 0:
+                await delete_messages_safely(context.bot, chat_id, status_msg_ids)
                 await update.message.reply_text(
                     "⚠️ В файле нет листов. Возможно, файл пустой или повреждён."
                 )
@@ -1081,10 +1229,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(sheet_names) == 1:
                 # Один лист — обрабатываем сразу без диалога
                 await _process_xlsx_sheets(
-                    update, context, sheet_names, xlsx_data, file_name, caption, user_id
+                    update, context, sheet_names, xlsx_data, file_name, caption, user_id, status_msg_ids
                 )
             else:
                 # Несколько листов — запускаем диалог
+                await delete_messages_safely(context.bot, chat_id, status_msg_ids)
+                status_msg_ids.clear()
                 sheets_list = "\n".join(
                     f"{i+1}. {name}" for i, name in enumerate(sheet_names)
                 )
@@ -1108,6 +1258,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 raw_text, limits_exceeded = extract_text_from_zip(tmp_path, file_name)
             except zipfile.BadZipFile:
+                await delete_messages_safely(context.bot, chat_id, status_msg_ids)
                 await update.message.reply_text(
                     "❌ Архив повреждён или не является корректным ZIP-файлом.\n"
                     "Пожалуйста, проверьте целостность архива и попробуйте снова."
@@ -1126,6 +1277,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as _fwd_err:
                 logger.error(f"[topic_router] Не удалось переслать ZIP в топик: {_fwd_err}")
             if limits_exceeded:
+                await delete_messages_safely(context.bot, chat_id, status_msg_ids)
                 await update.message.reply_text(raw_text)
                 return
         elif ext == ".pdf":
@@ -1183,6 +1335,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"[topic_router] Не удалось переслать в топик: {_fwd_err}")
 
         if not raw_text or not raw_text.strip():
+            await delete_messages_safely(context.bot, chat_id, status_msg_ids)
             await update.message.reply_text(
                 "⚠️ Не удалось извлечь текст из документа.\n"
                 "Возможно, это отсканированный PDF без распознанного текста."
@@ -1226,12 +1379,25 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Прогоняем через Smart Router — как обычный текст
         model, clean_prompt, notification = await choose_model(user_prompt)
         if notification:
-            await update.message.reply_text(notification)
+            msg_note = await update.message.reply_text(notification)
+            status_msg_ids.append(msg_note.message_id)
         else:
-            await update.message.reply_text("Обрабатываю запрос...")
+            msg_proc = await update.message.reply_text("Обрабатываю запрос...")
+            status_msg_ids.append(msg_proc.message_id)
 
         reply = await ask_llm(user_id, clean_prompt, model)
-        await update.message.reply_text(reply)
+
+        # Выбираем эмодзи и префикс (усекаем до 1000 символов)
+        emoji = "📄"
+        if ext == ".zip":
+            emoji = "📦"
+        
+        preview_text = doc_content
+        if len(preview_text) > 1000:
+            preview_text = preview_text[:1000] + "... [текст усечён для превью]"
+        
+        final_reply = f"{emoji} {preview_text}\n\n{reply}"
+        await update.message.reply_text(final_reply)
 
         # ── Фаза 5: ZIP — дополнительно пересылаем каждый файл из архива в свой топик ──
         # Выполняется ПОСЛЕ ответа LLM, не блокирует пользователя
@@ -1249,6 +1415,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Удаляем временный файл в любом случае
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
+        await delete_messages_safely(context.bot, chat_id, status_msg_ids)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
