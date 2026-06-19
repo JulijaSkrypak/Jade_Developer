@@ -13,6 +13,8 @@ import zipfile
 import shutil
 import math
 from dotenv import load_dotenv
+load_dotenv()  # должен выполниться ДО импорта topic_router (читает os.getenv при импорте)
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import httpx
@@ -20,8 +22,7 @@ from groq import Groq
 import pdfplumber
 import docx as python_docx
 import openpyxl
-
-load_dotenv()
+from topic_router import forward_to_topic, get_topic_id_for_file
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -79,12 +80,12 @@ async def choose_model(text: str) -> tuple[str, str, str]:
     if low.startswith("@claude"):
         clean = text.strip()[7:].strip()   # убираем "@claude"
         friendly = get_friendly_name(MODEL_COMPLEX)
-        return MODEL_COMPLEX, clean, f"🎯 Подключаю {friendly}..."
+        return MODEL_COMPLEX, clean, f"Подключаю {friendly}..."
 
     if low.startswith("@gemini"):
         clean = text.strip()[7:].strip()   # убираем "@gemini"
         friendly = get_friendly_name(MODEL_SIMPLE)
-        return MODEL_SIMPLE, clean, f"⚡ Подключаю {friendly}..."
+        return MODEL_SIMPLE, clean, f"Подключаю {friendly}..."
 
     # 2. Router LLM — быстрый вызов для классификации
     try:
@@ -122,7 +123,7 @@ async def choose_model(text: str) -> tuple[str, str, str]:
 
     if "complex" in verdict:
         friendly = get_friendly_name(MODEL_COMPLEX)
-        return MODEL_COMPLEX, text, f"🧠 Подключаю {friendly}..."
+        return MODEL_COMPLEX, text, f"Подключаю {friendly}..."
     else:
         return MODEL_SIMPLE, text, ""   # simple — без уведомления
 
@@ -217,7 +218,7 @@ async def transcribe_audio(ogg_path: str) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я JadeBridge — бот с умным роутером 🤖\n\n"
+        "JadeBridge стартовал.\n\n"
         "Пиши вопросы — модель выберется автоматически.\n"
         "Или используй префикс:\n"
         "  • @claude — Sonnet для сложных задач\n"
@@ -272,7 +273,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if notification:
         await update.message.reply_text(notification)
     else:
-        await update.message.reply_text("Думаю... 🤔")
+        await update.message.reply_text("Обрабатываю запрос...")
 
     try:
         reply = await ask_llm(user_id, clean_text, model)
@@ -288,7 +289,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Всегда использует MODEL_VOICE (Gemini Flash) — не затронуто роутером.
     """
     user_id = update.effective_user.id
-    await update.message.reply_text("🎙️ Слышу тебя, распознаю...")
+    await update.message.reply_text("Распознаю...")
 
     try:
         voice = update.message.voice
@@ -306,10 +307,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Не удалось распознать речь. Попробуй ещё раз.")
             return
 
-        await update.message.reply_text(f"📝 Распознано:\n{recognized_text}")
-        await update.message.reply_text("Думаю... 🤔")
+        await update.message.reply_text(f"Распознано...\n🎙️ {recognized_text}")
+        await update.message.reply_text("Обрабатываю запрос...")
         reply = await ask_llm(user_id, recognized_text, MODEL_VOICE)
         await update.message.reply_text(reply)
+
+        # ── Фаза 5: пересылка транскрипции в топик Тексты ─────────────────────
+        # forward_to_topic сам ловит все ошибки — не нарушает основной flow
+        await forward_to_topic(context.bot, topic_name="texts", text=f"🎙️ {recognized_text}")
 
     except subprocess.CalledProcessError as e:
         logger.error(f"ffmpeg error: {e.stderr.decode()}")
@@ -317,6 +322,97 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Voice handler error: {e}")
         await update.message.reply_text(f"❌ Ошибка обработки голосового: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ФОТО / ВИДЕО (Telegram-превью)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает фото, отправленные как Telegram-превью (message.photo).
+    Vision: анализирует содержимое через LLM (OpenRouter vision-capable model).
+    Фаза 5: дополнительно пересылает оригинал в TOPIC_IMAGES_ID через file_id
+    (без повторного скачивания — Telegram берёт из своего хранилища).
+    """
+    user_id = update.effective_user.id
+    photo = update.message.photo[-1]  # наибольшее доступное разрешение
+    caption = update.message.caption or ""
+
+    await update.message.reply_text("🖼️ Анализирую фото...")
+
+    try:
+        # Скачиваем фото для vision-анализа
+        photo_file = await context.bot.get_file(photo.file_id)
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            photo_path = tmp.name
+        await photo_file.download_to_drive(photo_path)
+
+        import base64
+        with open(photo_path, "rb") as f:
+            photo_b64 = base64.b64encode(f.read()).decode()
+        os.remove(photo_path)
+
+        user_question = caption.strip() if caption.strip() else "Опиши подробно, что изображено на фото."
+
+        # Vision-запрос через OpenRouter (Claude Sonnet умеет vision)
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": MODEL_COMPLEX,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": user_question},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
+                            ],
+                        }
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            reply = resp.json()["choices"][0]["message"]["content"]
+
+        await update.message.reply_text(reply)
+
+    except Exception as e:
+        logger.error(f"handle_photo error: {e}")
+        await update.message.reply_text(f"❌ Не удалось проанализировать фото: {e}")
+
+    # ── Фаза 5: пересылка оригинала в топик Images ────────────────────────────
+    # Выполняется ПОСЛЕ основного ответа пользователю, ошибка не ломает flow
+    await forward_to_topic(
+        context.bot,
+        topic_name="images",
+        file_id=photo.file_id,
+        media_type="photo",
+    )
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает видео, отправленные как Telegram-превью (message.video).
+    Фаза 5: пересылает в TOPIC_IMAGES_ID через file_id (без LLM-анализа видео).
+    LLM-анализ видео — вне рамок данной фазы.
+    """
+    video = update.message.video
+
+    await update.message.reply_text("🎬 Видео получено...")
+
+    # ── Фаза 5: пересылка в топик Images ──────────────────────────────────────
+    await forward_to_topic(
+        context.bot,
+        topic_name="images",
+        file_id=video.file_id,
+        media_type="video",
+    )
+    await update.message.reply_text("✅ Видео архивировано в топик Images.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -491,6 +587,43 @@ def extract_text_from_zip(zip_path: str, archive_name: str) -> tuple[str, bool]:
 
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+async def _forward_zip_contents_to_topics(bot, zip_path: str) -> None:
+    """
+    Фаза 5: Открывает ZIP и пересылает каждый поддерживаемый файл внутри
+    в соответствующий топик (за маршрутизацией из get_topic_id_for_file).
+    Файлы без Telegram file_id отправляются как байты (InputFile).
+    Ошибка отдельного файла не прерывает обработку остальных.
+    """
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            entries = [
+                e for e in zf.infolist()
+                if not any(
+                    e.filename.startswith(prefix) or os.path.basename(e.filename) == prefix
+                    for prefix in ZIP_IGNORE_PREFIXES
+                )
+                and not e.is_dir()
+            ]
+            for entry in entries:
+                short_name = entry.filename
+                try:
+                    file_bytes = zf.read(entry.filename)
+                    base_name = os.path.basename(short_name)
+                    topic_id = get_topic_id_for_file(base_name)
+                    await forward_to_topic(
+                        bot,
+                        topic_id=topic_id,
+                        file_bytes=file_bytes,
+                        file_name=base_name,
+                    )
+                except Exception as file_err:
+                    logger.warning(
+                        f"[zip_forward] Не удалось переслать {short_name!r}: {file_err}"
+                    )
+    except Exception as e:
+        logger.error(f"[zip_forward] Ошибка при пересылке содержимого ZIP: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -763,7 +896,7 @@ async def _send_xlsx_to_llm(
     if notification:
         await update.message.reply_text(notification)
     else:
-        await update.message.reply_text("Думаю... 🤔")
+        await update.message.reply_text("Обрабатываю запрос...")
 
     reply = await ask_llm(user_id, clean_prompt, model)
     await update.message.reply_text(reply)
@@ -873,7 +1006,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Проверка расширения
     ext = os.path.splitext(file_name)[1].lower()
+
+    # Фаза 5.1: неподдерживаемые форматы — пересылаем сразу с пометкой в топик ATTENTION
     if ext not in (".pdf", ".docx", ".txt", ".md", ".json", ".zip", ".xlsx"):
+        try:
+            _fwd_topic_id = get_topic_id_for_file(file_name, document.mime_type)
+            await forward_to_topic(
+                context.bot,
+                topic_id=_fwd_topic_id,
+                file_id=document.file_id,
+                file_name=file_name,
+                extracted_text=f"⚠️ Формат {ext or 'неизвестный'} — не поддерживается",
+            )
+        except Exception as _fwd_err:
+            logger.error(f"[topic_router] Не удалось переслать файл в топик: {_fwd_err}")
         await update.message.reply_text(
             f"⚠️ Формат {ext or 'неизвестный'} пока не поддерживается.\n"
             "Поддерживаю: PDF (.pdf), Word (.docx), текст (.txt, .md), JSON (.json), "
@@ -883,11 +1029,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if ext == ".zip":
-        await update.message.reply_text(f"📦 Получил архив «{file_name}», распаковываю...")
+        await update.message.reply_text(f"📦 Распаковываю архив «{file_name}»...")
     elif ext == ".xlsx":
-        await update.message.reply_text(f"📊 Получил таблицу «{file_name}», читаю...")
+        await update.message.reply_text(f"📊 Анализирую таблицу «{file_name}»...")
     else:
-        await update.message.reply_text(f"📄 Получил документ «{file_name}», читаю...")
+        await update.message.reply_text(f"📄 Анализирую документ «{file_name}»...")
 
     # Скачиваем файл во временную папку
     tmp_path = None
@@ -912,6 +1058,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             sheet_names = xlsx_data["sheet_names"]
+
+            # Фаза 5.1: пересылаем XLSX с метаданными листов
+            try:
+                _fwd_topic_id = get_topic_id_for_file(file_name, document.mime_type)
+                await forward_to_topic(
+                    context.bot,
+                    topic_id=_fwd_topic_id,
+                    file_id=document.file_id,
+                    file_name=file_name,
+                    metadata={"sheets": sheet_names},
+                )
+            except Exception as _fwd_err:
+                logger.error(f"[topic_router] Не удалось переслать XLSX в топик: {_fwd_err}")
 
             if len(sheet_names) == 0:
                 await update.message.reply_text(
@@ -954,17 +1113,74 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Пожалуйста, проверьте целостность архива и попробуйте снова."
                 )
                 return
+            # Фаза 5.1: ZIP пересылаем сразу после извлечения текста
+            try:
+                _fwd_topic_id = get_topic_id_for_file(file_name, document.mime_type)
+                await forward_to_topic(
+                    context.bot,
+                    topic_id=_fwd_topic_id,
+                    file_id=document.file_id,
+                    file_name=file_name,
+                    extracted_text=raw_text if not limits_exceeded else None,
+                )
+            except Exception as _fwd_err:
+                logger.error(f"[topic_router] Не удалось переслать ZIP в топик: {_fwd_err}")
             if limits_exceeded:
                 await update.message.reply_text(raw_text)
                 return
         elif ext == ".pdf":
-            raw_text = extract_text_from_pdf(tmp_path)
+            raw_text = None
+            try:
+                raw_text = extract_text_from_pdf(tmp_path)
+            except Exception as pdf_err:
+                logger.warning(f"PDF: не удалось извлечь текст из {file_name}: {pdf_err}")
+
+            # Фаза 5.1: PDF — пересылаем с thumbnail первой страницы и подписью
+            try:
+                _fwd_topic_id = get_topic_id_for_file(file_name, document.mime_type)
+                await forward_to_topic(
+                    context.bot,
+                    topic_id=_fwd_topic_id,
+                    file_id=document.file_id,
+                    file_name=file_name,
+                    file_path=tmp_path,
+                    file_type="pdf",
+                    extracted_text=raw_text,
+                )
+            except Exception as _fwd_err:
+                logger.error(f"[topic_router] Не удалось переслать PDF в топик: {_fwd_err}")
         elif ext == ".docx":
-            raw_text = extract_text_from_docx(tmp_path)
+            raw_text = None
+            try:
+                raw_text = extract_text_from_docx(tmp_path)
+            except Exception as docx_err:
+                logger.warning(f"DOCX: не удалось извлечь текст из {file_name}: {docx_err}")
         elif ext in (".txt", ".md"):
-            raw_text = extract_text_from_plain(tmp_path)
+            raw_text = None
+            try:
+                raw_text = extract_text_from_plain(tmp_path)
+            except Exception as plain_err:
+                logger.warning(f"TXT/MD: не удалось извлечь текст из {file_name}: {plain_err}")
         elif ext == ".json":
-            raw_text = extract_text_from_json(tmp_path)
+            raw_text = None
+            try:
+                raw_text = extract_text_from_json(tmp_path)
+            except Exception as json_err:
+                logger.warning(f"JSON: не удалось извлечь текст из {file_name}: {json_err}")
+
+        # Фаза 5.1: DOCX/TXT/MD/JSON — пересылаем с подписью (PDF и ZIP переслали выше)
+        if ext in (".docx", ".txt", ".md", ".json"):
+            try:
+                _fwd_topic_id = get_topic_id_for_file(file_name, document.mime_type)
+                await forward_to_topic(
+                    context.bot,
+                    topic_id=_fwd_topic_id,
+                    file_id=document.file_id,
+                    file_name=file_name,
+                    extracted_text=raw_text,
+                )
+            except Exception as _fwd_err:
+                logger.error(f"[topic_router] Не удалось переслать в топик: {_fwd_err}")
 
         if not raw_text or not raw_text.strip():
             await update.message.reply_text(
@@ -1012,10 +1228,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if notification:
             await update.message.reply_text(notification)
         else:
-            await update.message.reply_text("Думаю... 🤔")
+            await update.message.reply_text("Обрабатываю запрос...")
 
         reply = await ask_llm(user_id, clean_prompt, model)
         await update.message.reply_text(reply)
+
+        # ── Фаза 5: ZIP — дополнительно пересылаем каждый файл из архива в свой топик ──
+        # Выполняется ПОСЛЕ ответа LLM, не блокирует пользователя
+        if ext == ".zip" and tmp_path and os.path.exists(tmp_path):
+            await _forward_zip_contents_to_topics(context.bot, tmp_path)
 
     except Exception as e:
         logger.error(f"Document handler error: {e}")
@@ -1040,11 +1261,14 @@ app.add_handler(CommandHandler("ping", ping))
 app.add_handler(CommandHandler("clear", clear))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 if __name__ == "__main__":
     logger.info(
         "Bot started with Smart Router (choose_model) + Groq Whisper STT "
-        "+ PDF/DOCX/TXT/MD/JSON/ZIP/XLSX support"
+        "+ PDF/DOCX/TXT/MD/JSON/ZIP/XLSX support "
+        "+ Фаза 5: маршрутизация по топикам Jade_Developer"
     )
     app.run_polling()

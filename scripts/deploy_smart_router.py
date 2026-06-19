@@ -9,7 +9,7 @@ import time
 
 HOST = "178.105.1.60"
 USER = "root"
-PASSWORD = "htTgTgtWrqdP"
+KEY_FILE = "/home/julija/.ssh/vps_jade_developer"
 BOT_DIR = "/home/bridge/vibe-telegram-bot"
 LOCAL_NEW_BOT = "/home/julija/Документы/Antigravity/Jade_Developer/scripts/new_bot.py"
 
@@ -33,7 +33,7 @@ def main():
     print("🔌 Подключаюсь к VPS...")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(HOST, username=USER, password=PASSWORD, timeout=15)
+    client.connect(HOST, username=USER, key_filename=KEY_FILE, timeout=15)
     print("✅ Подключено!")
 
     # 1. Backup

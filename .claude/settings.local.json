@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(pip3 install *)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(scp -i ~/.ssh/vps_jade_developer /home/julija/Документы/Antigravity/Jade_Developer/topic_router.py /home/julija/Документы/Antigravity/Jade_Developer/bot.py /home/julija/Документы/Antigravity/Jade_Developer/tests/test_phase_5_topics.py root@178.105.1.60:/home/bridge/vibe-telegram-bot/)",
+      "Bash(ssh -i ~/.ssh/vps_jade_developer root@178.105.1.60 \"mkdir -p /home/bridge/vibe-telegram-bot/tests && cp /home/bridge/vibe-telegram-bot/test_phase_5_topics.py /home/bridge/vibe-telegram-bot/tests/test_phase_5_topics.py\")",
+      "Bash(ssh *)"
     ]
   }
 }
