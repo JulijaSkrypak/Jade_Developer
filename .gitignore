@@ -10,3 +10,9 @@ credentials.env
 *.log
 venv/
 __pycache__/
+
+# Базы данных
+*.db
+*.db-journal
+*.db-shm
+*.db-wal

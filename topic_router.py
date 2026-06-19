@@ -66,6 +66,8 @@ def _build_ext_map() -> dict[str, str]:
         ".jpeg": "images",
         ".png":  "images",
         ".webp": "images",
+        ".gif":  "images",
+        ".mp4":  "images",
         # Архивы
         ".zip":  "archives",
     }
@@ -80,7 +82,7 @@ def _topic_name_from_mime(mime_type: str) -> str | None:
         return None
     m = mime_type.lower().strip()
 
-    if m.startswith("image/"):
+    if m.startswith("image/") or m.startswith("video/"):
         return "images"
     if m == "text/csv":
         return "tables"
@@ -232,53 +234,45 @@ async def forward_to_topic(
     file_id: str | None = None,
     file_bytes: bytes | None = None,
     file_name: str | None = None,
-    media_type: str = "document",  # "document" | "photo" | "video"
+    media_type: str = "document",  # "document" | "photo" | "video" | "video_note" | "animation"
     # Фаза 5.1: дополнительные параметры для caption и thumbnail
     file_path: str | None = None,       # локальный путь (для генерации PDF thumbnail)
     file_type: str | None = None,       # "pdf", "docx" и т.п.
     extracted_text: str | None = None,  # текст для подписи
     metadata: dict | None = None,       # доп. метаданные (например {"sheets": [...]})
-) -> None:
+    reply_markup = None,                 # InlineKeyboardMarkup | None
+) -> any:
     """
     Пересылает контент в топик супергруппы. Ошибки перехватываются и логируются,
     но НИКОГДА не выбрасываются наружу — основной flow пользователя не нарушается.
 
-    Args:
-        bot:           экземпляр telegram.Bot
-        topic_id:      явный thread_id топика (приоритет над topic_name)
-        topic_name:    логическое имя топика ('texts', 'tables', 'images', 'archives', 'attention')
-        text:          текстовое сообщение (для транскрипций голоса и т.п.)
-        file_id:       Telegram file_id (не скачиваем — Telegram передаёт сам)
-        file_bytes:    байты файла (для файлов из ZIP, у которых нет file_id)
-        file_name:     имя файла (для caption / InputFile)
-        media_type:    тип медиа при отправке file_id ("document", "photo", "video")
-        file_path:     локальный путь к файлу (используется для PDF thumbnail)
-        file_type:     тип файла-строка ("pdf", "docx" …)
-        extracted_text: текст для включения в caption
-        metadata:      доп. метаданные для caption (например {"sheets": ["Sheet1", "Sheet2"]})
+    Returns:
+        Message | None — отправленное сообщение, или None при ошибке/пропуске.
     """
     # Определяем thread_id
     if topic_id is None and topic_name is not None:
         topic_id = _topic_id_by_name(topic_name)
 
     if SUPERGROUP_ID is None:
-        logger.debug("[topic_router] SUPERGROUP_ID не задан — пересылка пропущена")
-        return
+        logger.debug("[topic_router] SUPERGROUP_ID не задан — пересылка пропущен")
+        return None
 
     if topic_id is None:
         logger.warning("[topic_router] Нет topic_id и TOPIC_ATTENTION_ID не задан — пересылка пропущена")
-        return
+        return None
 
     try:
         if text is not None:
             # Текстовое сообщение (транскрипция голоса, расшифровка)
             caption_text = text[:4096]  # Telegram лимит
-            await bot.send_message(
+            msg = await bot.send_message(
                 chat_id=SUPERGROUP_ID,
                 message_thread_id=topic_id,
                 text=caption_text,
+                reply_markup=reply_markup,
             )
             logger.info(f"[topic_router] Текст отправлен в топик thread_id={topic_id}")
+            return msg
 
         elif file_id is not None:
             # Отправка через file_id — дёшево, Telegram сам берёт из хранилища
@@ -293,37 +287,57 @@ async def forward_to_topic(
                 thumb = generate_pdf_thumbnail(file_path)
                 if thumb:
                     from telegram import InputFile
-                    await bot.send_photo(
+                    msg = await bot.send_photo(
                         chat_id=SUPERGROUP_ID,
                         message_thread_id=topic_id,
                         photo=InputFile(io.BytesIO(thumb), filename="preview.png"),
                         caption=caption,
+                        reply_markup=reply_markup,
                     )
                     logger.info(f"[topic_router] PDF thumbnail отправлен в топик thread_id={topic_id}")
-                    return
+                    return msg
 
             if media_type == "photo":
-                await bot.send_photo(
+                msg = await bot.send_photo(
                     chat_id=SUPERGROUP_ID,
                     message_thread_id=topic_id,
                     photo=file_id,
                     caption=caption,
+                    reply_markup=reply_markup,
                 )
             elif media_type == "video":
-                await bot.send_video(
+                msg = await bot.send_video(
                     chat_id=SUPERGROUP_ID,
                     message_thread_id=topic_id,
                     video=file_id,
                     caption=caption,
+                    reply_markup=reply_markup,
+                )
+            elif media_type == "video_note":
+                msg = await bot.send_video_note(
+                    chat_id=SUPERGROUP_ID,
+                    message_thread_id=topic_id,
+                    video_note=file_id,
+                    reply_markup=reply_markup,
+                )
+            elif media_type == "animation":
+                msg = await bot.send_animation(
+                    chat_id=SUPERGROUP_ID,
+                    message_thread_id=topic_id,
+                    animation=file_id,
+                    caption=caption,
+                    reply_markup=reply_markup,
                 )
             else:
-                await bot.send_document(
+                msg = await bot.send_document(
                     chat_id=SUPERGROUP_ID,
                     message_thread_id=topic_id,
                     document=file_id,
                     caption=caption,
+                    reply_markup=reply_markup,
                 )
             logger.info(f"[topic_router] {media_type} (file_id) отправлен в топик thread_id={topic_id}")
+            return msg
 
         elif file_bytes is not None:
             # Отправка байт (файлы из ZIP — у них нет Telegram file_id)
@@ -344,14 +358,15 @@ async def forward_to_topic(
                         _tmp_pdf = tf.name
                     thumb = generate_pdf_thumbnail(_tmp_pdf)
                     if thumb:
-                        await bot.send_photo(
+                        msg = await bot.send_photo(
                             chat_id=SUPERGROUP_ID,
                             message_thread_id=topic_id,
                             photo=InputFile(io.BytesIO(thumb), filename="preview.png"),
                             caption=caption,
+                            reply_markup=reply_markup,
                         )
                         logger.info(f"[topic_router] PDF thumbnail (из bytes) отправлен в топик thread_id={topic_id}")
-                        return
+                        return msg
                 except Exception as _thumb_err:
                     logger.warning(f"[topic_router] PDF thumbnail из bytes не удалось: {_thumb_err}")
                 finally:
@@ -359,19 +374,23 @@ async def forward_to_topic(
                         os.remove(_tmp_pdf)
 
             input_file = InputFile(io.BytesIO(file_bytes), filename=fname)
-            await bot.send_document(
+            msg = await bot.send_document(
                 chat_id=SUPERGROUP_ID,
                 message_thread_id=topic_id,
                 document=input_file,
                 caption=caption,
+                reply_markup=reply_markup,
             )
             logger.info(f"[topic_router] Файл {fname!r} (bytes) отправлен в топик thread_id={topic_id}")
+            return msg
 
         else:
             logger.warning("[topic_router] forward_to_topic вызван без text/file_id/file_bytes — пропущен")
+            return None
 
     except Exception as e:
         logger.error(
             f"[topic_router] Ошибка пересылки в топик thread_id={topic_id}: {e} "
             f"(основной flow не затронут)"
         )
+        return None

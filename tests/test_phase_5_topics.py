@@ -167,7 +167,7 @@ class TestRouterUnknownExtension(unittest.TestCase):
         self.router = _reload_router()
 
     def test_unknown_extensions_to_attention(self):
-        for fname in ["archive.rar", "file.7z", "binary.bin", "video.mp4"]:
+        for fname in ["archive.rar", "file.7z", "binary.bin"]:
             with self.subTest(fname=fname):
                 tid = self.router.get_topic_id_for_file(fname)
                 self.assertEqual(tid, 50, f"Ожидался TOPIC_ATTENTION_ID=50 для {fname!r}")
@@ -873,28 +873,17 @@ class TestStatusMessageDeletionAndPrefixes(unittest.IsolatedAsyncioTestCase):
         # Проверяем, что окончательный ответ содержит префикс 🎙️ и распознанный текст
         self.mock_msg.reply_text.assert_any_call("🎙️ Тестовая речь\n\nАнализ ответа LLM")
 
-    @patch("bot.httpx.AsyncClient")
+    @patch("ai_service.ask_vision", new_callable=AsyncMock, return_value="Анализ картинки")
     @patch("bot.forward_to_topic", new_callable=AsyncMock)
     @patch("bot.tempfile.NamedTemporaryFile")
     @patch("bot.os.remove")
     @patch("builtins.open", new_callable=mock_open, read_data=b"fake jpeg data")
-    async def test_handle_photo_status_deletion_and_prefix(self, mock_file_open, mock_remove, mock_temp, mock_forward, mock_client_class):
+    async def test_handle_photo_status_deletion_and_prefix(self, mock_file_open, mock_remove, mock_temp, mock_forward, mock_ask_vision):
         # Настраиваем mock для скачивания файла
         self.context.bot.get_file = AsyncMock()
         mock_file = MagicMock()
         mock_file.name = "temp.jpg"
         mock_temp.return_value.__enter__.return_value = mock_file
-
-        # Настраиваем mock для httpx post
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json = lambda: {
-            "choices": [{"message": {"content": "Анализ картинки"}}]
-        }
-        
-        mock_client = MagicMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client_class.return_value.__aenter__.return_value = mock_client
 
         self.mock_msg.photo = [MagicMock()]
         self.mock_msg.caption = "Что на фото?"
@@ -1006,6 +995,150 @@ class TestShouldProcessMessage(unittest.TestCase):
         """Сообщения из посторонних групп/супергрупп игнорируются."""
         update = self._make_mock_update(chat_id=-1001111111111, chat_type="supergroup", is_bot=False, thread_id=None)
         self.assertFalse(self.bot.should_process_message(update))
+
+
+class TestVideoNoteAndAnimationRouting(unittest.TestCase):
+    def setUp(self):
+        self.router = _reload_router()
+
+    def test_gif_extension_to_images(self):
+        tid = self.router.get_topic_id_for_file("animation.gif")
+        self.assertEqual(tid, 30)  # TOPIC_IMAGES_ID
+
+    def test_mime_gif_to_images(self):
+        tid = self.router.get_topic_id_for_file("noext", mime_type="image/gif")
+        self.assertEqual(tid, 30)
+
+    def test_mime_video_mp4_to_images(self):
+        tid = self.router.get_topic_id_for_file("video.mp4", mime_type="video/mp4")
+        self.assertEqual(tid, 30)
+
+
+class TestSQLiteOperations(unittest.TestCase):
+    def setUp(self):
+        import bot
+        self.bot = bot
+        self.original_db = bot.DB_FILE
+        self.bot.DB_FILE = "test_jade_bridge.db"
+        self.bot.init_db()
+
+    def tearDown(self):
+        import os
+        self.bot.DB_FILE = self.original_db
+        if os.path.exists("test_jade_bridge.db"):
+            os.remove("test_jade_bridge.db")
+
+    def test_save_and_get_forwarded_file(self):
+        self.bot.save_forwarded_file(
+            chat_id=-100123,
+            message_id=456,
+            file_id="test_file_id",
+            file_type="document",
+            file_name="test.pdf",
+            extracted_text="Some text content",
+            metadata={"sheets": ["Sheet1"]}
+        )
+
+        res = self.bot.get_forwarded_file(-100123, 456)
+        self.assertIsNotNone(res)
+        self.assertEqual(res["file_id"], "test_file_id")
+        self.assertEqual(res["file_type"], "document")
+        self.assertEqual(res["file_name"], "test.pdf")
+        self.assertEqual(res["extracted_text"], "Some text content")
+        self.assertEqual(res["metadata"], {"sheets": ["Sheet1"]})
+
+    def test_get_nonexistent_returns_none(self):
+        res = self.bot.get_forwarded_file(-100123, 999)
+        self.assertIsNone(res)
+
+
+class TestCallbackHandlers(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import bot
+        self.bot = bot
+        self.original_db = bot.DB_FILE
+        self.bot.DB_FILE = "test_jade_bridge.db"
+        self.bot.init_db()
+
+        # Mock update and callback_query
+        self.query = MagicMock()
+        self.query.answer = AsyncMock()
+        self.query.data = "ai_analyze:sonnet"
+        
+        self.message = MagicMock()
+        self.message.chat.id = -100123
+        self.message.message_id = 456
+        self.message.reply_text = AsyncMock()
+        
+        # Переопределяем reply_text для возврата mock-сообщения
+        self.analysis_msg = MagicMock()
+        self.analysis_msg.edit_text = AsyncMock()
+        self.message.reply_text.return_value = self.analysis_msg
+        
+        self.query.message = self.message
+
+        self.update = MagicMock()
+        self.update.callback_query = self.query
+
+        self.context = MagicMock()
+        self.context.bot = MagicMock()
+
+    def tearDown(self):
+        import os
+        self.bot.DB_FILE = self.original_db
+        if os.path.exists("test_jade_bridge.db"):
+            os.remove("test_jade_bridge.db")
+
+    @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="Подробный анализ от Claude")
+    async def test_callback_document_analysis(self, mock_ask):
+        # Сначала сохраняем запись о файле
+        self.bot.save_forwarded_file(
+            chat_id=-100123,
+            message_id=456,
+            file_id="doc_id",
+            file_type="document",
+            file_name="report.pdf",
+            extracted_text="Содержимое отчета"
+        )
+
+        await self.bot.handle_ai_analyze_callback(self.update, self.context)
+
+        # Проверяем, что callback query завершен
+        self.query.answer.assert_called_once()
+        
+        # Проверяем запуск анализа
+        self.message.reply_text.assert_called_once_with(
+            "🧠 Запуск глубокого анализа (Claude Sonnet 4.6)...",
+            reply_to_message_id=456
+        )
+
+        # Проверяем вызов модели с правильными параметрами
+        mock_ask.assert_called_once()
+        args = mock_ask.call_args[0]
+        self.assertIn("Содержимое отчета", args[0][1]["content"])
+
+        # Проверяем, что результат опубликован
+        self.analysis_msg.edit_text.assert_called_once()
+        self.assertIn("Подробный анализ от Claude", self.analysis_msg.edit_text.call_args[0][0])
+
+    async def test_callback_video_returns_stub(self):
+        # Видеокружочки возвращают заглушку
+        self.bot.save_forwarded_file(
+            chat_id=-100123,
+            message_id=456,
+            file_id="video_id",
+            file_type="video_note",
+            file_name="circle.mp4"
+        )
+
+        await self.bot.handle_ai_analyze_callback(self.update, self.context)
+
+        # Проверяем, что callback query завершен
+        self.query.answer.assert_called_once()
+        
+        # Проверяем, что отредактированное сообщение содержит заглушку
+        self.analysis_msg.edit_text.assert_called_once()
+        self.assertIn("Функция глубокого анализа видео временно недоступна", self.analysis_msg.edit_text.call_args[0][0])
 
 
 if __name__ == "__main__":

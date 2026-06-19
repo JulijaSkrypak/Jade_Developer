@@ -23,6 +23,7 @@ CRED_PATH  = os.path.join(LOCAL_ROOT, "credentials.env")
 FILES_TO_UPLOAD = [
     "bot.py",
     "topic_router.py",
+    "ai_service.py",
     "tests/test_phase_5_topics.py",
 ]
 
@@ -30,6 +31,9 @@ FILES_TO_UPLOAD = [
 ENV_KEYS = [
     "BOT_TOKEN",          # → TELEGRAM_TOKEN
     "OPENROUTER_API_KEY",
+    "OPENROUTER_BASE_URL",
+    "MODEL_SIMPLE",
+    "MODEL_COMPLEX",
     "GROQ_API_KEY",
     # Фаза 5: топики
     "SUPERGROUP_ID",
