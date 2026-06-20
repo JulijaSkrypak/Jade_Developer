@@ -544,21 +544,24 @@ class TestBuildCaption(unittest.TestCase):
     def setUp(self):
         self.router = _reload_router()
 
-    def test_only_filename(self):
+    def test_only_filename_returns_empty(self):
+        # filename is no longer included in caption text (Telegram shows it separately)
         result = self.router.build_caption("report.pdf")
-        self.assertEqual(result, "report.pdf")
+        self.assertEqual(result, "")
 
-    def test_with_extracted_text(self):
+    def test_with_extracted_text_uses_soderzhit_prefix(self):
+        """extracted_text теперь выводится с префиксом 'Содержит:'"""
         result = self.router.build_caption("doc.txt", extracted_text="Привет мир")
-        self.assertIn("doc.txt", result)
+        self.assertNotIn("doc.txt", result)
         self.assertIn("Привет мир", result)
+        self.assertIn("Содержит:", result)
 
-    def test_text_truncated_at_300(self):
-        long_text = "А" * 400
+    def test_long_text_still_under_1024(self):
+        """Длинный саммари (до 600 символов) + префикс всё равно помещается в 1024."""
+        long_text = "Б" * 600
         result = self.router.build_caption("file.txt", extracted_text=long_text)
-        self.assertIn("...", result)
-        # Текст обрезан до 300 + "..."
         self.assertLessEqual(len(result), 1024)
+        self.assertIn("Содержит:", result)
 
     def test_with_metadata_sheets(self):
         result = self.router.build_caption("data.xlsx", metadata={"sheets": ["Sheet1", "Sheet2"]})
@@ -570,19 +573,32 @@ class TestBuildCaption(unittest.TestCase):
         result = self.router.build_caption("f.txt", extracted_text=long_text)
         self.assertLessEqual(len(result), 1024)
 
-    def test_empty_extracted_text_ignored(self):
+    def test_empty_extracted_text_returns_empty(self):
         result = self.router.build_caption("f.txt", extracted_text="   ")
-        self.assertEqual(result, "f.txt")
+        self.assertEqual(result, "")
 
-    def test_combined_filename_sheets_text(self):
+    def test_combined_sheets_and_text_no_filename(self):
         result = self.router.build_caption(
             "table.xlsx",
             extracted_text="Данные квартала",
             metadata={"sheets": ["Q1"]},
         )
-        self.assertIn("table.xlsx", result)
+        self.assertNotIn("table.xlsx", result)
         self.assertIn("Q1", result)
         self.assertIn("Данные квартала", result)
+        self.assertIn("Содержит:", result)
+
+    def test_archive_metadata_in_caption(self):
+        """Метаданные archive выводят '[из архива: X]' без пустой строки между елементами."""
+        result = self.router.build_caption(
+            "file.txt",
+            extracted_text="Описание файла",
+            metadata={"archive": "test.zip"},
+        )
+        self.assertIn("[из архива: test.zip]", result)
+        self.assertIn("Содержит: Описание файла", result)
+        # Проверяем отсутствие двойных пустых строк
+        self.assertNotIn("\n\n", result)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -849,6 +865,7 @@ class TestStatusMessageDeletionAndPrefixes(unittest.IsolatedAsyncioTestCase):
         self.context = MagicMock()
         self.context.bot = self.bot
         self.context.user_data = {}
+        self.context.bot_data = {}
 
     @patch("bot.ask_llm", new_callable=AsyncMock, return_value="Анализ ответа LLM")
     @patch("bot.transcribe_audio", new_callable=AsyncMock, return_value="Тестовая речь")
@@ -873,17 +890,12 @@ class TestStatusMessageDeletionAndPrefixes(unittest.IsolatedAsyncioTestCase):
         # Проверяем, что окончательный ответ содержит префикс 🎙️ и распознанный текст
         self.mock_msg.reply_text.assert_any_call("🎙️ Тестовая речь\n\nАнализ ответа LLM")
 
-    @patch("ai_service.ask_vision", new_callable=AsyncMock, return_value="Анализ картинки")
     @patch("bot.forward_to_topic", new_callable=AsyncMock)
-    @patch("bot.tempfile.NamedTemporaryFile")
-    @patch("bot.os.remove")
-    @patch("builtins.open", new_callable=mock_open, read_data=b"fake jpeg data")
-    async def test_handle_photo_status_deletion_and_prefix(self, mock_file_open, mock_remove, mock_temp, mock_forward, mock_ask_vision):
-        # Настраиваем mock для скачивания файла
-        self.context.bot.get_file = AsyncMock()
-        mock_file = MagicMock()
-        mock_file.name = "temp.jpg"
-        mock_temp.return_value.__enter__.return_value = mock_file
+    async def test_handle_photo_status_deletion_and_prefix(self, mock_forward):
+        """handle_photo НЕ вызывает Vision-анализ — только пересылает и отвечает коротко."""
+        mock_fwd_msg = MagicMock()
+        mock_fwd_msg.message_id = 999
+        mock_forward.return_value = mock_fwd_msg
 
         self.mock_msg.photo = [MagicMock()]
         self.mock_msg.caption = "Что на фото?"
@@ -891,11 +903,14 @@ class TestStatusMessageDeletionAndPrefixes(unittest.IsolatedAsyncioTestCase):
         from bot import handle_photo
         await handle_photo(self.mock_update, self.context)
 
-        # Проверяем удаление статуса "Анализирую фото..."
+        # Статус удалён
         self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1000)
 
-        # Проверяем окончательный ответ с префиксом 🖼️
-        self.mock_msg.reply_text.assert_any_call("🖼️ Что на фото?\n\nАнализ картинки")
+        # Ответ пользователю — краткий статус, БЕЗ Vision-анализа
+        self.mock_msg.reply_text.assert_any_call("Файл адресован в: IMAGES.")
+
+        # forward_to_topic вызван
+        mock_forward.assert_called_once()
 
     @patch("bot.forward_to_topic", new_callable=AsyncMock)
     async def test_handle_video_status_deletion(self, mock_forward):
@@ -1082,6 +1097,7 @@ class TestCallbackHandlers(unittest.IsolatedAsyncioTestCase):
 
         self.context = MagicMock()
         self.context.bot = MagicMock()
+        self.context.bot_data = {}
 
     def tearDown(self):
         import os
@@ -1089,9 +1105,8 @@ class TestCallbackHandlers(unittest.IsolatedAsyncioTestCase):
         if os.path.exists("test_jade_bridge.db"):
             os.remove("test_jade_bridge.db")
 
-    @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="Подробный анализ от Claude")
-    async def test_callback_document_analysis(self, mock_ask):
-        # Сначала сохраняем запись о файле
+    async def test_callback_document_analysis(self):
+        """Callback отправляет 'Ваш запрос: ...?' в deferred-режиме."""
         self.bot.save_forwarded_file(
             chat_id=-100123,
             message_id=456,
@@ -1103,26 +1118,27 @@ class TestCallbackHandlers(unittest.IsolatedAsyncioTestCase):
 
         await self.bot.handle_ai_analyze_callback(self.update, self.context)
 
-        # Проверяем, что callback query завершен
+        # Callback query завершён
         self.query.answer.assert_called_once()
-        
-        # Проверяем запуск анализа
-        self.message.reply_text.assert_called_once_with(
-            "🧠 Запуск глубокого анализа (Claude Sonnet 4.6)...",
-            reply_to_message_id=456
-        )
 
-        # Проверяем вызов модели с правильными параметрами
-        mock_ask.assert_called_once()
-        args = mock_ask.call_args[0]
-        self.assertIn("Содержимое отчета", args[0][1]["content"])
+        # Вместо анализа — вопрос-опрос
+        self.message.reply_text.assert_called_once()
+        call_text = self.message.reply_text.call_args[0][0]
+        self.assertEqual(call_text, "Ваш запрос: ...?")
+        self.assertEqual(self.message.reply_text.call_args.kwargs.get("reply_to_message_id"), 456)
 
-        # Проверяем, что результат опубликован
-        self.analysis_msg.edit_text.assert_called_once()
-        self.assertIn("Подробный анализ от Claude", self.analysis_msg.edit_text.call_args[0][0])
+        # Немедленный анализ НЕ запущен
+        self.analysis_msg.edit_text.assert_not_called()
+
+        # pending_analyses заполнен
+        self.assertIn("pending_analyses", self.context.bot_data)
+        entries = list(self.context.bot_data["pending_analyses"].values())
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["model_choice"], "sonnet")
+        self.assertEqual(entries[0]["file_message_id"], 456)
 
     async def test_callback_video_returns_stub(self):
-        # Видеокружочки возвращают заглушку
+        """Callback для видеокружочка тоже переходит в deferred-режим."""
         self.bot.save_forwarded_file(
             chat_id=-100123,
             message_id=456,
@@ -1133,12 +1149,905 @@ class TestCallbackHandlers(unittest.IsolatedAsyncioTestCase):
 
         await self.bot.handle_ai_analyze_callback(self.update, self.context)
 
-        # Проверяем, что callback query завершен
+        # Callback query завершён
         self.query.answer.assert_called_once()
-        
-        # Проверяем, что отредактированное сообщение содержит заглушку
-        self.analysis_msg.edit_text.assert_called_once()
-        self.assertIn("Функция глубокого анализа видео временно недоступна", self.analysis_msg.edit_text.call_args[0][0])
+
+        # Вопрос-опрос отправлен
+        self.message.reply_text.assert_called_once()
+        call_text = self.message.reply_text.call_args[0][0]
+        self.assertEqual(call_text, "Ваш запрос: ...?")
+
+        # Анализ НЕ запущен немедленно
+        self.analysis_msg.edit_text.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 17. build_caption — тег архива (Задача 2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBuildCaptionArchiveTag(unittest.TestCase):
+    """build_caption с ключом archive в metadata → тег в начале подписи."""
+
+    def setUp(self):
+        self.router = _reload_router()
+
+    def test_archive_tag_at_start(self):
+        result = self.router.build_caption("report.pdf", metadata={"archive": "project.zip"})
+        self.assertTrue(result.startswith("[из архива: project.zip]"))
+
+    def test_archive_tag_at_start_no_filename(self):
+        result = self.router.build_caption("doc.pdf", metadata={"archive": "test.zip"})
+        self.assertTrue(result.startswith("[из архива: test.zip]"))
+        self.assertNotIn("doc.pdf", result)
+
+    def test_no_archive_tag_without_metadata(self):
+        result = self.router.build_caption("doc.pdf")
+        self.assertNotIn("[из архива:", result)
+
+    def test_archive_and_sheets_together(self):
+        result = self.router.build_caption(
+            "data.xlsx",
+            metadata={"archive": "bundle.zip", "sheets": ["Sheet1"]},
+        )
+        self.assertIn("[из архива: bundle.zip]", result)
+        self.assertIn("Sheet1", result)
+
+    def test_archive_with_extracted_text(self):
+        result = self.router.build_caption(
+            "notes.txt",
+            extracted_text="Текст файла",
+            metadata={"archive": "docs.zip"},
+        )
+        self.assertIn("[из архива: docs.zip]", result)
+        self.assertNotIn("notes.txt", result)
+        self.assertIn("Текст файла", result)
+
+    def test_caption_within_1024_with_archive(self):
+        result = self.router.build_caption(
+            "big.txt",
+            extracted_text="X" * 2000,
+            metadata={"archive": "arch.zip"},
+        )
+        self.assertLessEqual(len(result), 1024)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 18. forward_to_topic — file_bytes + media_type (Задача 1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestForwardToTopicFileBytesMediaType(unittest.TestCase):
+    """Задача 1: file_bytes ветка поддерживает photo/video/animation."""
+
+    def setUp(self):
+        self.router = _reload_router()
+
+    def test_file_bytes_photo_calls_send_photo(self):
+        mock_bot = MagicMock()
+        mock_bot.send_photo = AsyncMock()
+        asyncio.run(self.router.forward_to_topic(
+            mock_bot, topic_id=30,
+            file_bytes=b"fake_image", file_name="img.jpg", media_type="photo",
+        ))
+        mock_bot.send_photo.assert_called_once()
+        self.assertEqual(mock_bot.send_photo.call_args.kwargs["message_thread_id"], 30)
+
+    def test_file_bytes_video_calls_send_video(self):
+        mock_bot = MagicMock()
+        mock_bot.send_video = AsyncMock()
+        asyncio.run(self.router.forward_to_topic(
+            mock_bot, topic_id=30,
+            file_bytes=b"fake_video", file_name="clip.mp4", media_type="video",
+        ))
+        mock_bot.send_video.assert_called_once()
+        self.assertEqual(mock_bot.send_video.call_args.kwargs["message_thread_id"], 30)
+
+    def test_file_bytes_animation_calls_send_animation(self):
+        mock_bot = MagicMock()
+        mock_bot.send_animation = AsyncMock()
+        asyncio.run(self.router.forward_to_topic(
+            mock_bot, topic_id=30,
+            file_bytes=b"fake_gif", file_name="anim.gif", media_type="animation",
+        ))
+        mock_bot.send_animation.assert_called_once()
+        self.assertEqual(mock_bot.send_animation.call_args.kwargs["message_thread_id"], 30)
+
+    def test_file_bytes_default_calls_send_document(self):
+        mock_bot = MagicMock()
+        mock_bot.send_document = AsyncMock()
+        asyncio.run(self.router.forward_to_topic(
+            mock_bot, topic_id=10,
+            file_bytes=b"data", file_name="data.csv",
+        ))
+        mock_bot.send_document.assert_called_once()
+
+    def test_file_bytes_photo_not_document(self):
+        mock_bot = MagicMock()
+        mock_bot.send_photo = AsyncMock()
+        mock_bot.send_document = AsyncMock()
+        asyncio.run(self.router.forward_to_topic(
+            mock_bot, topic_id=30,
+            file_bytes=b"img", file_name="img.png", media_type="photo",
+        ))
+        mock_bot.send_photo.assert_called_once()
+        mock_bot.send_document.assert_not_called()
+
+    def test_file_bytes_error_logs_filename(self):
+        """Ошибка отправки file_bytes логируется с именем файла."""
+        import logging
+        mock_bot = MagicMock()
+        mock_bot.send_document = AsyncMock(side_effect=RuntimeError("network"))
+        with self.assertLogs("topic_router", level="ERROR") as cm:
+            asyncio.run(self.router.forward_to_topic(
+                mock_bot, topic_id=10,
+                file_bytes=b"x", file_name="broken.txt", media_type="document",
+            ))
+        self.assertTrue(any("broken.txt" in line for line in cm.output))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 19. extract_text_from_zip — 3-tuple возврат (Задача 1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestExtractTextFromZip3Tuple(unittest.TestCase):
+    """Задача 1: extract_text_from_zip возвращает (text, exceeded, files_info)."""
+
+    def _make_zip(self, files: dict) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, content in files.items():
+                zf.writestr(name, content)
+        return buf.getvalue()
+
+    def _write_zip(self, files: dict):
+        zip_bytes = self._make_zip(files)
+        f = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        f.write(zip_bytes)
+        f.close()
+        return f.name
+
+    def test_returns_3_tuple(self):
+        import bot as _bot
+        zp = self._write_zip({"note.txt": "hello"})
+        try:
+            result = _bot.extract_text_from_zip(zp, "test.zip")
+        finally:
+            os.remove(zp)
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 3)
+
+    def test_files_info_keys(self):
+        import bot as _bot
+        zp = self._write_zip({"doc.txt": "content"})
+        try:
+            _, _, files_info = _bot.extract_text_from_zip(zp, "archive.zip")
+        finally:
+            os.remove(zp)
+        for key in ("total_files", "processed_count", "entries"):
+            self.assertIn(key, files_info)
+
+    def test_processed_count_for_txt(self):
+        import bot as _bot
+        zp = self._write_zip({"readme.txt": "Hello world"})
+        try:
+            _, _, files_info = _bot.extract_text_from_zip(zp, "arc.zip")
+        finally:
+            os.remove(zp)
+        self.assertEqual(files_info["total_files"], 1)
+        self.assertEqual(files_info["processed_count"], 1)
+
+    def test_unsupported_file_not_counted(self):
+        """
+        Медиафайлы (.jpg) теперь считаются обработанными (processed_count=1).
+        Для проверки что НЕподдерживаемый файл не засчитывается — используем .rar.
+        """
+        import bot as _bot
+        # .rar — действительно неподдерживаемый формат
+        zp = self._write_zip({"archive.rar": b"Rar!"})
+        try:
+            _, _, files_info = _bot.extract_text_from_zip(zp, "arc.zip")
+        finally:
+            os.remove(zp)
+        self.assertEqual(files_info["total_files"], 1)
+        self.assertEqual(files_info["processed_count"], 0,
+                         ".rar должен быть в unsupported, processed_count=0")
+        self.assertIn("archive.rar", files_info.get("unsupported_names", []))
+
+    def test_jpg_counted_as_processed(self):
+        """
+        Изображения (.jpg) теперь считаются обработанными (маршрутизуются в Images).
+        """
+        import bot as _bot
+        zp = self._write_zip({"img.jpg": b"\xff\xd8\xff"})
+        try:
+            _, _, files_info = _bot.extract_text_from_zip(zp, "arc.zip")
+        finally:
+            os.remove(zp)
+        self.assertEqual(files_info["total_files"], 1)
+        self.assertEqual(files_info["processed_count"], 1,
+                         ".jpg считается обработанным (маршрутизация в Images)")
+        self.assertNotIn("img.jpg", files_info.get("unsupported_names", []))
+
+    def test_limits_exceeded_returns_3_tuple(self):
+        import bot as _bot
+        original_max = _bot.ZIP_MAX_FILES
+        _bot.ZIP_MAX_FILES = 0
+        try:
+            zp = self._write_zip({"a.txt": "x"})
+            try:
+                result = _bot.extract_text_from_zip(zp, "big.zip")
+            finally:
+                os.remove(zp)
+        finally:
+            _bot.ZIP_MAX_FILES = original_max
+        self.assertEqual(len(result), 3)
+        _, limits_exceeded, files_info = result
+        self.assertTrue(limits_exceeded)
+        self.assertIn("total_files", files_info)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 20. should_process_message — pending_analyses check (Задача 5)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestShouldProcessMessageWithPendingAnalyses(unittest.TestCase):
+    """Задача 5: should_process_message разрешает Reply на pending_analyses."""
+
+    def setUp(self):
+        import importlib
+        os.environ["SUPERGROUP_ID"] = "-1004295196278"
+        import topic_router
+        importlib.reload(topic_router)
+        import bot
+        importlib.reload(bot)
+        self.bot_module = bot
+
+    def _make_update_with_reply(self, chat_id, thread_id, reply_to_id):
+        update = MagicMock()
+        update.effective_chat.id = chat_id
+        update.effective_chat.type = "supergroup"
+        update.effective_user.is_bot = False
+        update.effective_user.name = "@user"
+        update.effective_user.id = 1
+        update.message.message_thread_id = thread_id
+        update.message.text = "Анализ"
+        update.message.caption = None
+        reply_msg = MagicMock()
+        reply_msg.message_id = reply_to_id
+        update.message.reply_to_message = reply_msg
+        return update
+
+    def test_other_topic_reply_to_pending_allowed(self):
+        update = self._make_update_with_reply(-1004295196278, 118, 555)
+        context = MagicMock()
+        context.bot_data = {"pending_analyses": {555: {"file_message_id": 100}}}
+        self.assertTrue(self.bot_module.should_process_message(update, context))
+
+    def test_other_topic_reply_not_in_pending_denied(self):
+        update = self._make_update_with_reply(-1004295196278, 118, 999)
+        context = MagicMock()
+        context.bot_data = {"pending_analyses": {555: {"file_message_id": 100}}}
+        self.assertFalse(self.bot_module.should_process_message(update, context))
+
+    def test_other_topic_without_context_denied(self):
+        update = self._make_update_with_reply(-1004295196278, 118, 555)
+        self.assertFalse(self.bot_module.should_process_message(update))
+
+    def test_general_topic_still_allowed(self):
+        update = self._make_update_with_reply(-1004295196278, None, 555)
+        context = MagicMock()
+        context.bot_data = {}
+        self.assertTrue(self.bot_module.should_process_message(update, context))
+
+    def test_empty_pending_does_not_unlock_other_topics(self):
+        update = self._make_update_with_reply(-1004295196278, 118, 555)
+        context = MagicMock()
+        context.bot_data = {"pending_analyses": {}}
+        self.assertFalse(self.bot_module.should_process_message(update, context))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 21. handle_ai_analyze_callback — deferred режим (Задача 5)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestCallbackDeferredMode(unittest.IsolatedAsyncioTestCase):
+    """Задача 5: handle_ai_analyze_callback отправляет 'Ваш запрос: ...?' не анализ."""
+
+    def setUp(self):
+        import bot
+        self.bot_module = bot
+        self.original_db = bot.DB_FILE
+        self.bot_module.DB_FILE = "test_callback_deferred.db"
+        self.bot_module.init_db()
+
+        self.query = MagicMock()
+        self.query.answer = AsyncMock()
+        self.query.data = "ai_analyze:sonnet"
+        self.query.from_user.id = 777
+
+        self.question_msg = MagicMock()
+        self.question_msg.message_id = 300
+
+        self.message = MagicMock()
+        self.message.chat.id = -100123
+        self.message.message_id = 456
+        self.message.reply_text = AsyncMock(return_value=self.question_msg)
+
+        self.query.message = self.message
+        self.update = MagicMock()
+        self.update.callback_query = self.query
+
+        self.context = MagicMock()
+        self.context.bot = MagicMock()
+        self.context.bot_data = {}
+
+    def tearDown(self):
+        self.bot_module.DB_FILE = self.original_db
+        if os.path.exists("test_callback_deferred.db"):
+            os.remove("test_callback_deferred.db")
+
+    async def test_sends_question_not_analysis(self):
+        self.bot_module.save_forwarded_file(
+            chat_id=-100123, message_id=456,
+            file_id="doc_id", file_type="document",
+            file_name="report.pdf", extracted_text="Текст отчёта",
+        )
+        await self.bot_module.handle_ai_analyze_callback(self.update, self.context)
+
+        self.query.answer.assert_called_once()
+        self.message.reply_text.assert_called_once()
+        self.assertEqual(self.message.reply_text.call_args[0][0], "Ваш запрос: ...?")
+
+    async def test_pending_analyses_populated_with_correct_metadata(self):
+        self.bot_module.save_forwarded_file(
+            chat_id=-100123, message_id=456,
+            file_id="f_id", file_type="photo", file_name="img.jpg",
+        )
+        await self.bot_module.handle_ai_analyze_callback(self.update, self.context)
+
+        pending = self.context.bot_data.get("pending_analyses", {})
+        self.assertEqual(len(pending), 1)
+        entry = list(pending.values())[0]
+        self.assertEqual(entry["file_message_id"], 456)
+        self.assertEqual(entry["model_choice"], "sonnet")
+        self.assertEqual(entry["chat_id"], -100123)
+
+    async def test_no_file_info_sends_warning_no_pending(self):
+        await self.bot_module.handle_ai_analyze_callback(self.update, self.context)
+        self.message.reply_text.assert_called_once()
+        self.assertIn("отсутствует в базе данных", self.message.reply_text.call_args[0][0])
+        self.assertNotIn("pending_analyses", self.context.bot_data)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 22. handle_text — перехват pending_analyses Reply (Задача 5)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestHandleTextDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
+    """Задача 5: handle_text запускает execute_deferred_analysis при Reply."""
+
+    def setUp(self):
+        self.bot_obj = MagicMock()
+        self.bot_obj.delete_message = AsyncMock()
+
+        self.mock_update = MagicMock()
+        self.mock_update.effective_chat.id = 9999
+        self.mock_update.effective_chat.type = "private"
+        self.mock_update.effective_user.is_bot = False
+        self.mock_update.effective_user.name = "@user"
+        self.mock_update.effective_user.id = 1
+
+        self.mock_msg = MagicMock()
+        self.mock_msg.message_id = 200
+        self.mock_msg.text = "Найди все даты в документе"
+        self.mock_msg.reply_text = AsyncMock(return_value=MagicMock(message_id=999))
+        reply_to = MagicMock()
+        reply_to.message_id = 100
+        self.mock_msg.reply_to_message = reply_to
+        self.mock_update.message = self.mock_msg
+
+        self.context = MagicMock()
+        self.context.bot = self.bot_obj
+        self.context.user_data = {}
+        self.context.bot_data = {
+            "pending_analyses": {
+                100: {
+                    "file_message_id": 50,
+                    "model_choice": "sonnet",
+                    "chat_id": 9999,
+                    "user_id": 1,
+                }
+            }
+        }
+
+    @patch("bot.execute_deferred_analysis", new_callable=AsyncMock)
+    async def test_text_reply_triggers_deferred_analysis(self, mock_exec):
+        from bot import handle_text
+        await handle_text(self.mock_update, self.context)
+        mock_exec.assert_called_once()
+        self.assertEqual(mock_exec.call_args[0][3], "Найди все даты в документе")
+        self.assertEqual(mock_exec.call_args[0][4], 100)
+
+    @patch("bot.execute_deferred_analysis", new_callable=AsyncMock)
+    async def test_pending_entry_removed_after_trigger(self, mock_exec):
+        from bot import handle_text
+        await handle_text(self.mock_update, self.context)
+        self.assertNotIn(100, self.context.bot_data["pending_analyses"])
+
+    @patch("bot.execute_deferred_analysis", new_callable=AsyncMock)
+    async def test_no_reply_to_message_skips_deferred(self, mock_exec):
+        self.mock_msg.reply_to_message = None
+        from bot import handle_text
+        # Normal flow — deferred NOT triggered
+        with patch("bot.choose_model", new_callable=AsyncMock,
+                   return_value=("google/gemini-3.5-flash", "text", "")):
+            with patch("bot.ask_llm", new_callable=AsyncMock, return_value="ok"):
+                await handle_text(self.mock_update, self.context)
+        mock_exec.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 23. handle_voice — перехват pending_analyses Reply (Задача 5)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestHandleVoiceDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
+    """Задача 5: handle_voice распознаёт речь и запускает execute_deferred_analysis."""
+
+    def setUp(self):
+        self.bot_obj = MagicMock()
+        self.bot_obj.delete_message = AsyncMock()
+
+        self.mock_update = MagicMock()
+        self.mock_update.effective_chat.id = 9999
+        self.mock_update.effective_chat.type = "private"
+        self.mock_update.effective_user.is_bot = False
+        self.mock_update.effective_user.name = "@user"
+        self.mock_update.effective_user.id = 1
+
+        self.mock_msg = MagicMock()
+        self.mock_msg.message_id = 201
+        self.mock_msg.voice = MagicMock()
+
+        reply_to = MagicMock()
+        reply_to.message_id = 101
+        self.mock_msg.reply_to_message = reply_to
+
+        self.sent_messages = []
+        async def mock_reply_text(text, *a, **kw):
+            msg = MagicMock()
+            msg.message_id = len(self.sent_messages) + 2000
+            self.sent_messages.append((msg.message_id, text))
+            return msg
+        self.mock_msg.reply_text = AsyncMock(side_effect=mock_reply_text)
+        self.mock_update.message = self.mock_msg
+
+        self.context = MagicMock()
+        self.context.bot = self.bot_obj
+        self.context.user_data = {}
+        self.context.bot_data = {
+            "pending_analyses": {
+                101: {
+                    "file_message_id": 51,
+                    "model_choice": "gemini",
+                    "chat_id": 9999,
+                    "user_id": 1,
+                }
+            }
+        }
+
+    @patch("bot.execute_deferred_analysis", new_callable=AsyncMock)
+    @patch("bot.transcribe_audio", new_callable=AsyncMock, return_value="Текст из голоса")
+    @patch("bot.os.remove")
+    @patch("bot.tempfile.NamedTemporaryFile")
+    async def test_voice_reply_triggers_deferred(self, mock_tmp, mock_remove, mock_transcribe, mock_exec):
+        mock_file = MagicMock()
+        mock_file.name = "tmp.ogg"
+        mock_tmp.return_value.__enter__.return_value = mock_file
+        mock_voice_file = MagicMock()
+        mock_voice_file.download_to_drive = AsyncMock()
+        self.bot_obj.get_file = AsyncMock(return_value=mock_voice_file)
+
+        from bot import handle_voice
+        await handle_voice(self.mock_update, self.context)
+
+        mock_exec.assert_called_once()
+        self.assertEqual(mock_exec.call_args[0][3], "Текст из голоса")
+
+    @patch("bot.execute_deferred_analysis", new_callable=AsyncMock)
+    @patch("bot.transcribe_audio", new_callable=AsyncMock, return_value="Текст")
+    @patch("bot.os.remove")
+    @patch("bot.tempfile.NamedTemporaryFile")
+    async def test_voice_deferred_deletes_recognizing_status(self, mock_tmp, mock_remove, mock_transcribe, mock_exec):
+        """Статус '🎙️ Распознаю голос...' отправляется и удаляется."""
+        mock_file = MagicMock()
+        mock_file.name = "tmp.ogg"
+        mock_tmp.return_value.__enter__.return_value = mock_file
+        mock_voice_file = MagicMock()
+        mock_voice_file.download_to_drive = AsyncMock()
+        self.bot_obj.get_file = AsyncMock(return_value=mock_voice_file)
+
+        from bot import handle_voice
+        await handle_voice(self.mock_update, self.context)
+
+        sent_texts = [text for _, text in self.sent_messages]
+        self.assertIn("🎙️ Распознаю голос...", sent_texts)
+        self.bot_obj.delete_message.assert_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 24. execute_deferred_analysis — статус и анализ (Задача 5)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestExecuteDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
+    """Задача 5: execute_deferred_analysis отправляет статус и редактирует результатом."""
+
+    def setUp(self):
+        import bot
+        self.bot_module = bot
+        self.original_db = bot.DB_FILE
+        self.bot_module.DB_FILE = "test_exec_deferred.db"
+        self.bot_module.init_db()
+
+        self.status_msg = MagicMock()
+        self.status_msg.edit_text = AsyncMock()
+
+        self.bot_obj = MagicMock()
+        self.bot_obj.delete_message = AsyncMock()
+        self.bot_obj.send_message = AsyncMock(return_value=self.status_msg)
+        self.bot_obj.get_file = AsyncMock()
+
+        self.mock_update = MagicMock()
+        self.mock_update.message.message_id = 202
+
+        self.context = MagicMock()
+        self.context.bot = self.bot_obj
+        self.context.bot_data = {}
+
+    def tearDown(self):
+        self.bot_module.DB_FILE = self.original_db
+        if os.path.exists("test_exec_deferred.db"):
+            os.remove("test_exec_deferred.db")
+
+    @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="Результат анализа")
+    async def test_sends_status_and_edits_with_result(self, mock_ask):
+        self.bot_module.save_forwarded_file(
+            chat_id=9999, message_id=50,
+            file_id="doc_id", file_type="document",
+            file_name="report.pdf", extracted_text="Содержимое отчёта",
+        )
+        analysis_info = {
+            "file_message_id": 50, "model_choice": "sonnet",
+            "chat_id": 9999, "user_id": 1,
+        }
+        from bot import execute_deferred_analysis
+        await execute_deferred_analysis(
+            self.mock_update, self.context, analysis_info, "Найди выводы", 100
+        )
+        self.bot_obj.send_message.assert_called_once()
+        self.assertIn("Запуск глубокого анализа", self.bot_obj.send_message.call_args.kwargs["text"])
+        self.status_msg.edit_text.assert_called_once()
+        self.assertIn("Результат анализа", self.status_msg.edit_text.call_args[0][0])
+
+    async def test_deletes_question_and_user_messages(self):
+        """execute_deferred_analysis удаляет question_msg (100) и reply пользователя (202)."""
+        self.bot_module.save_forwarded_file(
+            chat_id=9999, message_id=50,
+            file_id="vid_id", file_type="video_note", file_name="circle.mp4",
+        )
+        analysis_info = {
+            "file_message_id": 50, "model_choice": "gemini",
+            "chat_id": 9999, "user_id": 1,
+        }
+        from bot import execute_deferred_analysis
+        await execute_deferred_analysis(
+            self.mock_update, self.context, analysis_info, "анализ", 100
+        )
+        deleted_ids = [c.kwargs.get("message_id") for c in self.bot_obj.delete_message.call_args_list]
+        self.assertIn(100, deleted_ids)
+        self.assertIn(202, deleted_ids)
+
+    async def test_no_file_info_edits_status_with_warning(self):
+        """Если файл не найден в БД — статус редактируется с предупреждением."""
+        analysis_info = {
+            "file_message_id": 9999, "model_choice": "sonnet",
+            "chat_id": 9999, "user_id": 1,
+        }
+        from bot import execute_deferred_analysis
+        await execute_deferred_analysis(
+            self.mock_update, self.context, analysis_info, "анализ", 100
+        )
+        self.status_msg.edit_text.assert_called_once()
+        self.assertIn("не найдена", self.status_msg.edit_text.call_args[0][0])
+
+    @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="Ответ на конкретный вопрос")
+    async def test_specific_query_includes_question_in_prompt(self, mock_ask):
+        """Конкретный запрос → вопрос пользователя включается в промпт."""
+        self.bot_module.save_forwarded_file(
+            chat_id=9999, message_id=50,
+            file_id="doc_id", file_type="document",
+            file_name="notes.txt", extracted_text="Большой текст документа",
+        )
+        analysis_info = {
+            "file_message_id": 50, "model_choice": "sonnet",
+            "chat_id": 9999, "user_id": 1,
+        }
+        from bot import execute_deferred_analysis
+        await execute_deferred_analysis(
+            self.mock_update, self.context, analysis_info,
+            "Сколько упоминаний слова 'риск'?", 100
+        )
+        mock_ask.assert_called_once()
+        prompt_content = mock_ask.call_args[0][0][1]["content"]
+        self.assertIn("Сколько упоминаний слова 'риск'?", prompt_content)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 25. _generate_caption_summary — LLM-саммари для подписей (Баг-фикс подписей)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestGenerateCaptionSummary(unittest.IsolatedAsyncioTestCase):
+    """_generate_caption_summary вызывает LLM и возвращает краткое описание."""
+
+    @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="Краткое описание файла")
+    async def test_returns_llm_summary(self, mock_ask):
+        from bot import _generate_caption_summary
+        result = await _generate_caption_summary("Полный текст документа", "doc.pdf")
+        self.assertEqual(result, "Краткое описание файла")
+        mock_ask.assert_called_once()
+
+    @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="Summary")
+    async def test_sends_raw_text_snippet_to_llm(self, mock_ask):
+        from bot import _generate_caption_summary
+        long_text = "X" * 5000
+        await _generate_caption_summary(long_text, "big.txt")
+        messages = mock_ask.call_args[0][0]
+        user_content = messages[1]["content"]
+        self.assertLessEqual(len(user_content), 3200)  # 3000 snippet + header
+
+    @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="Summary")
+    async def test_system_prompt_forbids_raw_markup(self, mock_ask):
+        from bot import _generate_caption_summary
+        await _generate_caption_summary("some text", "f.txt")
+        sys_msg = mock_ask.call_args[0][0][0]["content"]
+        self.assertIn("XML", sys_msg)
+        self.assertIn("HTML", sys_msg)
+
+    async def test_empty_text_returns_none(self):
+        from bot import _generate_caption_summary
+        self.assertIsNone(await _generate_caption_summary("", "f.txt"))
+        self.assertIsNone(await _generate_caption_summary("   ", "f.txt"))
+
+    @patch("ai_service.ask_llm", new_callable=AsyncMock, side_effect=RuntimeError("network"))
+    async def test_llm_error_returns_none(self, mock_ask):
+        from bot import _generate_caption_summary
+        result = await _generate_caption_summary("text", "file.txt")
+        self.assertIsNone(result)
+
+    @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="A" * 700)
+    async def test_result_capped_at_600_chars(self, mock_ask):
+        from bot import _generate_caption_summary
+        result = await _generate_caption_summary("content", "f.pdf")
+        self.assertLessEqual(len(result), 600)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 26. build_caption — нет сырого кода в подписи (Баг-фикс подписей)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestCaptionNoRawCode(unittest.TestCase):
+    """Проверяет, что build_caption не выводит типичные паттерны сырого кода."""
+
+    def setUp(self):
+        self.router = _reload_router()
+
+    def _raw_patterns(self):
+        return ["<html", "<?xml", "<head>", "<table>", "<tr>", "|", "| --- |"]
+
+    def test_llm_summary_passes_through_clean(self):
+        summary = "Спецификация байдарок серии Щука и Налим с ценами и размерами"
+        result = self.router.build_caption("spec.docx", extracted_text=summary)
+        # Новый формат: 'Содержит: <summary>'
+        self.assertIn("Содержит:", result)
+        self.assertIn(summary, result)
+
+    def test_filename_not_duplicated(self):
+        result = self.router.build_caption("report.pdf", extracted_text="Отчёт за квартал")
+        self.assertNotIn("report.pdf", result)
+
+    def test_no_filename_in_archive_caption(self):
+        result = self.router.build_caption(
+            "data.json",
+            extracted_text="JSON-спецификация продуктов",
+            metadata={"archive": "catalog.zip"},
+        )
+        self.assertNotIn("data.json", result)
+        self.assertIn("[из архива: catalog.zip]", result)
+        self.assertIn("JSON-спецификация продуктов", result)
+
+    def test_empty_summary_gives_empty_caption(self):
+        result = self.router.build_caption("f.txt", extracted_text="   ")
+        self.assertEqual(result, "")
+
+    def test_none_extracted_text_no_filename_fallback(self):
+        result = self.router.build_caption("report.xlsx", extracted_text=None)
+        self.assertEqual(result, "")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 27. Баг-фикс раунд 2: синхронизация ZIP_SUPPORTED_EXTS с маршрутизацией
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestZipSupportedExtsSync(unittest.TestCase):
+    """
+    Баг-фикс раунд 2, БАГ 1:
+    ZIP_SUPPORTED_EXTS должен содержать .xlsx (синхронизация с _EXT_TO_TOPIC).
+    .rar в ZIP остаётся неподдерживаемым — маршрутизируется в ATTENTION.
+    """
+
+    def test_xlsx_in_zip_supported_exts(self):
+        """ZIP_SUPPORTED_EXTS содержит .xlsx."""
+        import bot
+        self.assertIn(".xlsx", bot.ZIP_SUPPORTED_EXTS,
+                      ".xlsx должен быть в ZIP_SUPPORTED_EXTS (БАГ 1 исправлен)")
+
+    def test_pdf_in_zip_supported_exts(self):
+        import bot
+        self.assertIn(".pdf", bot.ZIP_SUPPORTED_EXTS)
+
+    def test_docx_in_zip_supported_exts(self):
+        import bot
+        self.assertIn(".docx", bot.ZIP_SUPPORTED_EXTS)
+
+    def test_txt_in_zip_supported_exts(self):
+        import bot
+        self.assertIn(".txt", bot.ZIP_SUPPORTED_EXTS)
+
+    def test_rar_not_in_zip_supported_exts(self):
+        """RAR не в ZIP_SUPPORTED_EXTS и не в _EXT_TO_TOPIC — маршрутизируется в ATTENTION."""
+        import bot
+        self.assertNotIn(".rar", bot.ZIP_SUPPORTED_EXTS)
+        # Проверяем через роутера
+        r = _reload_router()
+        tid = r.get_topic_id_for_file("archive.rar")
+        self.assertEqual(tid, 50, "RAR должен маршрутизироваться в TOPIC_ATTENTION_ID=50")
+
+    def test_xlsx_routes_to_tables_not_attention(self):
+        """.xlsx маршрутизируется в Таблицы (20), не в Внимание (50)."""
+        r = _reload_router()
+        tid = r.get_topic_id_for_file("report.xlsx")
+        self.assertEqual(tid, 20, ".xlsx должен идти в TOPIC_TABLES_ID=20")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 28. Баг-фикс раунд 2: верная структура сводки архива
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestZipArchiveSummaryTemplate(unittest.TestCase):
+    """
+    Баг-фикс раунд 2:
+    extract_text_from_zip возвращает корректный files_info с полями
+    unsupported_names, topic_labels, type_labels.
+    """
+
+    def _make_zip(self, files: dict) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, content in files.items():
+                zf.writestr(name, content)
+        return buf.getvalue()
+
+    def test_xlsx_counted_as_processed(self):
+        """.xlsx внутри ZIP считается обработанным, не попадает в unsupported_names."""
+        import bot
+        zip_bytes = self._make_zip({
+            "notes.txt": "Hello world",
+            "data.xlsx": b"PK\x03\x04" + b"\x00" * 26,  # minimal valid-looking header
+        })
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+            f.write(zip_bytes)
+            zip_path = f.name
+        try:
+            _, limits_exceeded, files_info = bot.extract_text_from_zip(zip_path, "test.zip")
+            self.assertFalse(limits_exceeded)
+            self.assertNotIn("data.xlsx", files_info.get("unsupported_names", []),
+                             ".xlsx не должен быть в unsupported_names (БАГ 1 исправлен)")
+        finally:
+            os.remove(zip_path)
+
+    def test_rar_inside_zip_in_unsupported(self):
+        """.rar внутри ZIP попадает в unsupported_names."""
+        import bot
+        zip_bytes = self._make_zip({
+            "notes.txt": "Hello world",
+            "archive.rar": b"Rar!",
+        })
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+            f.write(zip_bytes)
+            zip_path = f.name
+        try:
+            _, limits_exceeded, files_info = bot.extract_text_from_zip(zip_path, "test.zip")
+            self.assertFalse(limits_exceeded)
+            self.assertIn("archive.rar", files_info.get("unsupported_names", []),
+                          ".rar должен быть в unsupported_names")
+        finally:
+            os.remove(zip_path)
+
+    def test_rar_inside_zip_routes_to_attention_topic(self):
+        """.rar внутри ZIP: через get_topic_id_for_file попадает в ATTENTION."""
+        r = _reload_router()
+        tid = r.get_topic_id_for_file("archive.rar")
+        self.assertEqual(tid, 50, ".rar должен маршрутизироваться в TOPIC_ATTENTION_ID=50")
+
+    def test_files_info_has_required_fields(self):
+        """Возвращаемый files_info содержит все необходимые поля."""
+        import bot
+        zip_bytes = self._make_zip({"readme.txt": "Hello"})
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+            f.write(zip_bytes)
+            zip_path = f.name
+        try:
+            _, _, files_info = bot.extract_text_from_zip(zip_path, "test.zip")
+            for field in ("total_files", "processed_count", "entries",
+                          "unsupported_names", "topic_labels", "type_labels"):
+                self.assertIn(field, files_info, f"Поле {field!r} отсутствует в files_info")
+        finally:
+            os.remove(zip_path)
+
+    def test_topic_labels_for_txt_pdf(self):
+        """.txt и .pdf добавляют 'Тексты' в topic_labels."""
+        import bot
+        zip_bytes = self._make_zip({
+            "notes.txt": "content",
+            "doc.pdf": b"%PDF-1.4 fake",
+        })
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+            f.write(zip_bytes)
+            zip_path = f.name
+        try:
+            _, _, files_info = bot.extract_text_from_zip(zip_path, "test.zip")
+            self.assertIn("Тексты", files_info.get("topic_labels", []))
+        finally:
+            os.remove(zip_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 29. Баг-фикс раунд 2: системный промпт не содержит AI-boilerplate
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSystemPromptNoAiBoilerplate(unittest.TestCase):
+    """
+    Баг-фикс раунд 2, БАГ 2:
+    Системный промпт не должен содержать инструкцию добавлять 'Готов работать дальше.'
+    И должен содержать запрет на заключительные фразы.
+    """
+
+    def test_system_prompt_no_ready_to_work_phrase(self):
+        """
+        Системный промпт не должен давать инструкцию ПИСАТЬ 'Готов работать дальше.'
+        Фраза может упоминаться в контексте ЗАПРЕТА (это нормально).
+        """
+        import bot
+        prompt = bot.get_system_prompt()
+        # Промпт должен содержать запрет: 'ЗАПРЕЩЕНО добавлять'
+        self.assertIn("ЗАПРЕЩЕНО", prompt)
+        # Старая инструкция 'В самом конце твоего ответа должна находиться ровно одна ... Готов работать' должна отсутствовать
+        self.assertNotIn("в самом конце твоего ответа должна находиться ровно одна короткая профессиональная", prompt,
+                             "Олдая инструкция писать заключительную фразу не должна присутствовать")
+    def test_system_prompt_has_ban_on_closing_phrases(self):
+        """Промпт содержит явный запрет на заключительные фразы."""
+        import bot
+        prompt = bot.get_system_prompt()
+        # Промпт должен содержать слово ЗАПРЕЩЕНО (в русском)
+        self.assertIn("ЗАПРЕЩЕНО", prompt)
+
+    def test_caption_summary_prompt_no_boilerplate(self):
+        """Промпт _generate_caption_summary содержит запрет на 'Готов помочь' и подобные."""
+        # Проверяем содержание промпта через grep исходника функции
+        import inspect
+        import bot
+        source = inspect.getsource(bot._generate_caption_summary)
+        self.assertIn("Готов помочь", source,
+                      "Промпт должен содержать запрет на 'Готов помочь'")
+        self.assertIn("ЗАПРЕЩЕНО", source)
 
 
 if __name__ == "__main__":

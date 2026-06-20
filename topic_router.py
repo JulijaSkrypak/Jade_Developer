@@ -152,22 +152,22 @@ def build_caption(
     Строит подпись к файлу для отправки в топик (max 1024 символа — лимит Telegram).
 
     Формат:
-      <имя файла>
+      [из архива: имя_архива] (если metadata["archive"])
       Листы: ... (если metadata["sheets"])
-      <превью текста — до 300 символов>
+      Содержит: <LLM-саммари> (если extracted_text)
     """
-    parts = [file_name]
+    parts = []
+    if metadata:
+        archive = metadata.get("archive")
+        if archive:
+            parts.append(f"[из архива: {archive}]")
     if metadata:
         sheets = metadata.get("sheets")
         if sheets:
             parts.append("Листы: " + ", ".join(str(s) for s in sheets))
-    if extracted_text:
-        preview = extracted_text.strip()
-        if len(preview) > 300:
-            preview = preview[:300] + "..."
-        if preview:
-            parts.append(preview)
-    return "\n\n".join(parts)[:1024]
+    if extracted_text and extracted_text.strip():
+        parts.append("Содержит: " + extracted_text.strip())
+    return "\n".join(parts)[:1024]
 
 
 # ── Публичная функция-роутер ───────────────────────────────────────────────────
@@ -276,7 +276,8 @@ async def forward_to_topic(
 
         elif file_id is not None:
             # Отправка через file_id — дёшево, Telegram сам берёт из хранилища
-            caption = build_caption(file_name or "", extracted_text, metadata) if (extracted_text is not None or metadata is not None) else None
+            _raw_cap = build_caption(file_name or "", extracted_text, metadata) if (extracted_text is not None or metadata is not None) else None
+            caption = (_raw_cap.strip() or None) if _raw_cap is not None else None
 
             _is_pdf = (
                 file_type == "pdf"
@@ -342,7 +343,8 @@ async def forward_to_topic(
         elif file_bytes is not None:
             # Отправка байт (файлы из ZIP — у них нет Telegram file_id)
             from telegram import InputFile
-            caption = build_caption(file_name or "", extracted_text, metadata) if (extracted_text is not None or metadata is not None) else None
+            _raw_cap = build_caption(file_name or "", extracted_text, metadata) if (extracted_text is not None or metadata is not None) else None
+            caption = (_raw_cap.strip() or None) if _raw_cap is not None else None
 
             fname = file_name or "file"
             _is_pdf = (
@@ -374,14 +376,39 @@ async def forward_to_topic(
                         os.remove(_tmp_pdf)
 
             input_file = InputFile(io.BytesIO(file_bytes), filename=fname)
-            msg = await bot.send_document(
-                chat_id=SUPERGROUP_ID,
-                message_thread_id=topic_id,
-                document=input_file,
-                caption=caption,
-                reply_markup=reply_markup,
-            )
-            logger.info(f"[topic_router] Файл {fname!r} (bytes) отправлен в топик thread_id={topic_id}")
+            if media_type == "photo":
+                msg = await bot.send_photo(
+                    chat_id=SUPERGROUP_ID,
+                    message_thread_id=topic_id,
+                    photo=input_file,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                )
+            elif media_type == "video":
+                msg = await bot.send_video(
+                    chat_id=SUPERGROUP_ID,
+                    message_thread_id=topic_id,
+                    video=input_file,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                )
+            elif media_type == "animation":
+                msg = await bot.send_animation(
+                    chat_id=SUPERGROUP_ID,
+                    message_thread_id=topic_id,
+                    animation=input_file,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                )
+            else:
+                msg = await bot.send_document(
+                    chat_id=SUPERGROUP_ID,
+                    message_thread_id=topic_id,
+                    document=input_file,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                )
+            logger.info(f"[topic_router] Файл {fname!r} ({media_type}, bytes) отправлен в топик thread_id={topic_id}")
             return msg
 
         else:
@@ -390,7 +417,7 @@ async def forward_to_topic(
 
     except Exception as e:
         logger.error(
-            f"[topic_router] Ошибка пересылки в топик thread_id={topic_id}: {e} "
+            f"[topic_router] Ошибка пересылки файла {file_name!r} в топик thread_id={topic_id}: {e} "
             f"(основной flow не затронут)"
         )
         return None
