@@ -452,7 +452,7 @@ class TestSizeLimitTruncate(unittest.IsolatedAsyncioTestCase):
 
         sent_texts = []
 
-        async def capture_send(update, context, combined, caption, user_id):
+        async def capture_send(update, context, combined, caption, user_id, status_msg_ids):
             sent_texts.append(combined)
 
         with patch("bot._send_xlsx_to_llm", side_effect=capture_send):
