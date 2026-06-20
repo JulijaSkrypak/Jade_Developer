@@ -1365,7 +1365,7 @@ class TestExtractTextFromZip3Tuple(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestShouldProcessMessageWithPendingAnalyses(unittest.TestCase):
-    """Задача 5: should_process_message разрешает Reply на pending_analyses."""
+    """Задача 5: should_process_message разрешает Reply на сессии диалогов через get_file_dialog."""
 
     def setUp(self):
         import importlib
@@ -1394,30 +1394,30 @@ class TestShouldProcessMessageWithPendingAnalyses(unittest.TestCase):
     def test_other_topic_reply_to_pending_allowed(self):
         update = self._make_update_with_reply(-1004295196278, 118, 555)
         context = MagicMock()
-        context.bot_data = {"pending_analyses": {555: {"file_message_id": 100}}}
-        self.assertTrue(self.bot_module.should_process_message(update, context))
+        with patch("bot.get_file_dialog", return_value={"file_message_id": 100}):
+            self.assertTrue(self.bot_module.should_process_message(update, context))
 
     def test_other_topic_reply_not_in_pending_denied(self):
         update = self._make_update_with_reply(-1004295196278, 118, 999)
         context = MagicMock()
-        context.bot_data = {"pending_analyses": {555: {"file_message_id": 100}}}
-        self.assertFalse(self.bot_module.should_process_message(update, context))
+        with patch("bot.get_file_dialog", return_value=None):
+            self.assertFalse(self.bot_module.should_process_message(update, context))
 
     def test_other_topic_without_context_denied(self):
         update = self._make_update_with_reply(-1004295196278, 118, 555)
-        self.assertFalse(self.bot_module.should_process_message(update))
+        with patch("bot.get_file_dialog", return_value=None):
+            self.assertFalse(self.bot_module.should_process_message(update))
 
     def test_general_topic_still_allowed(self):
         update = self._make_update_with_reply(-1004295196278, None, 555)
         context = MagicMock()
-        context.bot_data = {}
         self.assertTrue(self.bot_module.should_process_message(update, context))
 
     def test_empty_pending_does_not_unlock_other_topics(self):
         update = self._make_update_with_reply(-1004295196278, 118, 555)
         context = MagicMock()
-        context.bot_data = {"pending_analyses": {}}
-        self.assertFalse(self.bot_module.should_process_message(update, context))
+        with patch("bot.get_file_dialog", return_value=None):
+            self.assertFalse(self.bot_module.should_process_message(update, context))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -424,17 +424,16 @@ def should_process_message(update: Update, context=None) -> bool:
         if thread_id is None or thread_id == TOPIC_JADE_ID:
             return True
         # Разрешаем Reply на сообщения из очереди ожидания отложенного анализа
-        if context is not None:
-            try:
-                pending = context.bot_data.get("pending_analyses", {})
-                if isinstance(pending, dict) and pending:
-                    reply_to_msg = getattr(update.message, "reply_to_message", None)
-                    if reply_to_msg:
-                        reply_to_id = getattr(reply_to_msg, "message_id", None)
-                        if reply_to_id and reply_to_id in pending:
-                            return True
-            except Exception:
-                pass
+        reply_to_msg = getattr(update.message, "reply_to_message", None)
+        if reply_to_msg:
+            reply_to_id = getattr(reply_to_msg, "message_id", None)
+            if reply_to_id is not None:
+                try:
+                    session = get_file_dialog(chat_id, reply_to_id)
+                    if session is not None:
+                        return True
+                except Exception:
+                    pass
         return False
 
     return False
