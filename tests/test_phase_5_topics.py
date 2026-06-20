@@ -589,13 +589,13 @@ class TestBuildCaption(unittest.TestCase):
         self.assertIn("Содержит:", result)
 
     def test_archive_metadata_in_caption(self):
-        """Метаданные archive выводят '[из архива: X]' без пустой строки между елементами."""
+        """Метаданные archive выводят '**[из архива: X]**' (жирный) без пустой строки между элементами."""
         result = self.router.build_caption(
             "file.txt",
             extracted_text="Описание файла",
             metadata={"archive": "test.zip"},
         )
-        self.assertIn("[из архива: test.zip]", result)
+        self.assertIn("**[из архива: test.zip]**", result)
         self.assertIn("Содержит: Описание файла", result)
         # Проверяем отсутствие двойных пустых строк
         self.assertNotIn("\n\n", result)
@@ -1173,11 +1173,11 @@ class TestBuildCaptionArchiveTag(unittest.TestCase):
 
     def test_archive_tag_at_start(self):
         result = self.router.build_caption("report.pdf", metadata={"archive": "project.zip"})
-        self.assertTrue(result.startswith("[из архива: project.zip]"))
+        self.assertTrue(result.startswith("**[из архива: project.zip]**"))
 
     def test_archive_tag_at_start_no_filename(self):
         result = self.router.build_caption("doc.pdf", metadata={"archive": "test.zip"})
-        self.assertTrue(result.startswith("[из архива: test.zip]"))
+        self.assertTrue(result.startswith("**[из архива: test.zip]**"))
         self.assertNotIn("doc.pdf", result)
 
     def test_no_archive_tag_without_metadata(self):
@@ -2048,6 +2048,132 @@ class TestSystemPromptNoAiBoilerplate(unittest.TestCase):
         self.assertIn("Готов помочь", source,
                       "Промпт должен содержать запрет на 'Готов помочь'")
         self.assertIn("ЗАПРЕЩЕНО", source)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 30. Жирный шрифт в caption + имя файла для фото
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBoldFormatting(unittest.TestCase):
+    """
+    Тесты Markdown-форматирования в captions:
+    - Тег архива **[из архива: X]** — жирный
+    - Фото — подпись начинается с 📷 имя_файла
+    - Форма parse_mode в forward_to_topic
+    """
+
+    def setUp(self):
+        self.router = _reload_router()
+
+    def test_archive_tag_is_bold(self):
+        """Тег архива выдаётся с двойными звёздочками (жирный Markdown)."""
+        result = self.router.build_caption(
+            "doc.txt",
+            extracted_text="Описание",
+            metadata={"archive": "data.zip"},
+        )
+        self.assertIn("**[из архива: data.zip]**", result)
+
+    def test_archive_tag_no_plain_brackets(self):
+        """Не должно быть необрамлённого (plain) тега архива."""
+        result = self.router.build_caption(
+            "doc.txt",
+            metadata={"archive": "data.zip"},
+        )
+        # Должен быть жирный, но не плейн
+        self.assertIn("**", result)
+        # Проверяем, что звёздочки есть и до, и после скобок
+        idx = result.find("[")
+        self.assertTrue(idx > 1 and result[idx-2:idx] == "**",
+                        f"[из архива:...] должен начинаться с **: {result!r}")
+
+    def test_photo_caption_has_filename(self):
+        """Для media_type='photo' caption начинается с '📷 имя_файла'."""
+        result = self.router.build_caption(
+            "youtube_analytics.png",
+            media_type="photo",
+        )
+        self.assertTrue(
+            result.startswith("📷 youtube_analytics.png"),
+            f"Caption должен начинаться с 📷 имя_файла: {result!r}"
+        )
+
+    def test_photo_from_archive_caption_has_both(self):
+        """Фото из архива: и 📷 имя, и **[из архива: X]**."""
+        result = self.router.build_caption(
+            "photo.png",
+            metadata={"archive": "my_archive.zip"},
+            media_type="photo",
+        )
+        self.assertIn("📷 photo.png", result)
+        self.assertIn("**[из архива: my_archive.zip]**", result)
+        # Имя должно быть выше тега архива
+        idx_photo = result.find("📷")
+        idx_archive = result.find("**[")
+        self.assertLess(idx_photo, idx_archive, "📷 должно быть до тега архива")
+
+    def test_document_type_no_filename_in_caption(self):
+        """Для документов имя не добавляется в caption (у send_document имя видно отдельно)."""
+        result = self.router.build_caption(
+            "report.pdf",
+            extracted_text="Описание",
+            media_type="document",
+        )
+        # Имя файла не должно быть в caption
+        self.assertNotIn("report.pdf", result)
+        self.assertIn("Содержит: Описание", result)
+
+    def test_forward_to_topic_photo_sends_with_parse_mode(self):
+        """Пересылка фото через file_id — send_photo вызывается с parse_mode='Markdown'."""
+        mock_bot = MagicMock()
+        mock_bot.send_photo = AsyncMock()
+
+        asyncio.run(self.router.forward_to_topic(
+            mock_bot,
+            topic_name="images",
+            file_id="photo_id_123",
+            file_name="test_img.jpg",
+            media_type="photo",
+        ))
+
+        mock_bot.send_photo.assert_called_once()
+        kwargs = mock_bot.send_photo.call_args.kwargs
+        self.assertEqual(kwargs.get("parse_mode"), "Markdown")
+
+    def test_forward_to_topic_document_sends_with_parse_mode(self):
+        """Пересылка документа через file_id — send_document вызывается с parse_mode='Markdown'."""
+        mock_bot = MagicMock()
+        mock_bot.send_document = AsyncMock()
+
+        asyncio.run(self.router.forward_to_topic(
+            mock_bot,
+            topic_name="texts",
+            file_id="doc_id_456",
+            file_name="report.pdf",
+            extracted_text="Краткое описание",
+            media_type="document",
+        ))
+
+        mock_bot.send_document.assert_called_once()
+        kwargs = mock_bot.send_document.call_args.kwargs
+        self.assertEqual(kwargs.get("parse_mode"), "Markdown")
+
+    def test_photo_caption_contains_filename_even_without_metadata(self):
+        """Для media_type='photo' caption содержит имя даже без extracted_text и metadata."""
+        result = self.router.build_caption(
+            "ph_0620_1423.jpg",
+            media_type="photo",
+        )
+        self.assertEqual(result, "📷 ph_0620_1423.jpg")
+
+    def test_caption_summary_prompt_uses_bold_vklucheno(self):
+        """Промпт _generate_caption_summary инструктирует LLM писать **Включено**: (с звёздочками)."""
+        import inspect
+        import bot
+        source = inspect.getsource(bot._generate_caption_summary)
+        self.assertIn("**Включено**", source,
+                      "Промпт должен содержать **Включено**: для Markdown-рендеринга")
 
 
 if __name__ == "__main__":

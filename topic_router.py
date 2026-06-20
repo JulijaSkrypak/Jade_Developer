@@ -147,20 +147,25 @@ def build_caption(
     file_name: str,
     extracted_text: str | None = None,
     metadata: dict | None = None,
+    media_type: str = "document",
 ) -> str:
     """
     Строит подпись к файлу для отправки в топик (max 1024 символа — лимит Telegram).
 
-    Формат:
-      [из архива: имя_архива] (если metadata["archive"])
-      Листы: ... (если metadata["sheets"])
+    Формат (Markdown, parse_mode="Markdown"):
+      📷 имя_файла             (только для photo — имя не видно в Telegram UI)
+      **[из архива: имя]**    (если metadata["archive"])
+      Листы: ...              (если metadata["sheets"])
       Содержит: <LLM-саммари> (если extracted_text)
     """
     parts = []
+    # Для фото имя файла явно добавляем в подпись (send_photo не показывает имя)
+    if media_type == "photo" and file_name:
+        parts.append(f"📷 {file_name}")
     if metadata:
         archive = metadata.get("archive")
         if archive:
-            parts.append(f"[из архива: {archive}]")
+            parts.append(f"**[из архива: {archive}]**")
     if metadata:
         sheets = metadata.get("sheets")
         if sheets:
@@ -276,7 +281,9 @@ async def forward_to_topic(
 
         elif file_id is not None:
             # Отправка через file_id — дёшево, Telegram сам берёт из хранилища
-            _raw_cap = build_caption(file_name or "", extracted_text, metadata) if (extracted_text is not None or metadata is not None) else None
+            # Для photo строим caption всегда (имя файла нужно даже без extracted_text)
+            _should_build = (extracted_text is not None or metadata is not None) or media_type == "photo"
+            _raw_cap = build_caption(file_name or "", extracted_text, metadata, media_type=media_type) if _should_build else None
             caption = (_raw_cap.strip() or None) if _raw_cap is not None else None
 
             _is_pdf = (
@@ -293,6 +300,7 @@ async def forward_to_topic(
                         message_thread_id=topic_id,
                         photo=InputFile(io.BytesIO(thumb), filename="preview.png"),
                         caption=caption,
+                        parse_mode="Markdown",
                         reply_markup=reply_markup,
                     )
                     logger.info(f"[topic_router] PDF thumbnail отправлен в топик thread_id={topic_id}")
@@ -304,6 +312,7 @@ async def forward_to_topic(
                     message_thread_id=topic_id,
                     photo=file_id,
                     caption=caption,
+                    parse_mode="Markdown",
                     reply_markup=reply_markup,
                 )
             elif media_type == "video":
@@ -312,6 +321,7 @@ async def forward_to_topic(
                     message_thread_id=topic_id,
                     video=file_id,
                     caption=caption,
+                    parse_mode="Markdown",
                     reply_markup=reply_markup,
                 )
             elif media_type == "video_note":
@@ -327,6 +337,7 @@ async def forward_to_topic(
                     message_thread_id=topic_id,
                     animation=file_id,
                     caption=caption,
+                    parse_mode="Markdown",
                     reply_markup=reply_markup,
                 )
             else:
@@ -335,6 +346,7 @@ async def forward_to_topic(
                     message_thread_id=topic_id,
                     document=file_id,
                     caption=caption,
+                    parse_mode="Markdown",
                     reply_markup=reply_markup,
                 )
             logger.info(f"[topic_router] {media_type} (file_id) отправлен в топик thread_id={topic_id}")
@@ -343,7 +355,9 @@ async def forward_to_topic(
         elif file_bytes is not None:
             # Отправка байт (файлы из ZIP — у них нет Telegram file_id)
             from telegram import InputFile
-            _raw_cap = build_caption(file_name or "", extracted_text, metadata) if (extracted_text is not None or metadata is not None) else None
+            # Для photo строим caption всегда (имя файла нужно даже без extracted_text)
+            _should_build = (extracted_text is not None or metadata is not None) or media_type == "photo"
+            _raw_cap = build_caption(file_name or "", extracted_text, metadata, media_type=media_type) if _should_build else None
             caption = (_raw_cap.strip() or None) if _raw_cap is not None else None
 
             fname = file_name or "file"
@@ -365,6 +379,7 @@ async def forward_to_topic(
                             message_thread_id=topic_id,
                             photo=InputFile(io.BytesIO(thumb), filename="preview.png"),
                             caption=caption,
+                            parse_mode="Markdown",
                             reply_markup=reply_markup,
                         )
                         logger.info(f"[topic_router] PDF thumbnail (из bytes) отправлен в топик thread_id={topic_id}")
@@ -382,6 +397,7 @@ async def forward_to_topic(
                     message_thread_id=topic_id,
                     photo=input_file,
                     caption=caption,
+                    parse_mode="Markdown",
                     reply_markup=reply_markup,
                 )
             elif media_type == "video":
@@ -390,6 +406,7 @@ async def forward_to_topic(
                     message_thread_id=topic_id,
                     video=input_file,
                     caption=caption,
+                    parse_mode="Markdown",
                     reply_markup=reply_markup,
                 )
             elif media_type == "animation":
@@ -398,6 +415,7 @@ async def forward_to_topic(
                     message_thread_id=topic_id,
                     animation=input_file,
                     caption=caption,
+                    parse_mode="Markdown",
                     reply_markup=reply_markup,
                 )
             else:
@@ -406,6 +424,7 @@ async def forward_to_topic(
                     message_thread_id=topic_id,
                     document=input_file,
                     caption=caption,
+                    parse_mode="Markdown",
                     reply_markup=reply_markup,
                 )
             logger.info(f"[topic_router] Файл {fname!r} ({media_type}, bytes) отправлен в топик thread_id={topic_id}")

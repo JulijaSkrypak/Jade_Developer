@@ -28,6 +28,9 @@ import docx as python_docx
 import openpyxl
 from topic_router import forward_to_topic, get_topic_id_for_file, SUPERGROUP_ID
 
+TOPIC_JADE_ID: int = int(os.getenv("TOPIC_JADE_ID", "1"))
+
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -285,8 +288,11 @@ async def transcribe_audio(ogg_path: str) -> str:
 def should_process_message(update: Update, context=None) -> bool:
     """
     Проверяет, нужно ли обрабатывать сообщение.
-    Разрешает обработку только для приватных чатов и топика General в супергруппе SUPERGROUP_ID.
-    Также разрешает Reply на сообщения из очереди pending_analyses (любой топик).
+    Разрешает обработку только для:
+      - приватных чатов (DM с ботом)
+      - топика Jade в супергруппе SUPERGROUP_ID
+        (thread_id=None или thread_id=TOPIC_JADE_ID, Telegram может присылать оба варианта)
+      - Reply на сообщения из очереди pending_analyses (любой топик)
     Игнорирует сообщения от ботов.
     """
     if not update.effective_user or not update.effective_chat or not update.message:
@@ -334,7 +340,9 @@ def should_process_message(update: Update, context=None) -> bool:
 
     if SUPERGROUP_ID is not None and chat_id == SUPERGROUP_ID:
         thread_id = update.message.message_thread_id
-        if thread_id is None:
+        # Топик Jade (бывший General, thread_id=1) — входной топик для пользователей.
+        # Принимаем два варианта: None (старое поведение Telegram API) и TOPIC_JADE_ID (=1).
+        if thread_id is None or thread_id == TOPIC_JADE_ID:
             return True
         # Разрешаем Reply на сообщения из очереди ожидания отложенного анализа
         if context is not None:
@@ -569,10 +577,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_status = await update.message.reply_text("🖼️ Обрабатываю фото...")
         status_msg_ids.append(msg_status.message_id)
 
+        # Генерируем имя файла ph_MMDD_HHMM.jpg (Telegram не передаёт имя для прямых фото)
+        _photo_ts = datetime.datetime.now().strftime("%m%d_%H%M")
+        _photo_file_name = f"ph_{_photo_ts}.jpg"
+
         msg = await forward_to_topic(
             context.bot,
             topic_name="images",
             file_id=photo.file_id,
+            file_name=_photo_file_name,
             media_type="photo",
             reply_markup=get_ai_analyze_keyboard(),
         )
@@ -582,7 +595,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message_id=msg.message_id,
                 file_id=photo.file_id,
                 file_type="photo",
-                file_name="photo.jpg",
+                file_name=_photo_file_name,
             )
         await update.message.reply_text("Файл адресован в: IMAGES.")
     except Exception as e:
@@ -713,9 +726,9 @@ async def _generate_caption_summary(raw_text: str, file_name: str) -> str | None
                 "content": (
                     "Опиши содержимое файла строго по формату:\n"
                     "— Первая строка: одно предложение, суть файла (что это и для чего).\n"
-                    "— Если есть конкретные ключевые данные, добавь: «Включено:» и список "
+                    "— Если есть конкретные ключевые данные, добавь: **Включено**: и список "
                     "не более чем из 2 коротких пунктов (каждый — одна строка).\n"
-                    "— Если ключевых данных нет — пункт «Включено:» пропускай.\n"
+                    "— Если ключевых данных нет — пункт **Включено**: пропускай.\n"
                     "— Итого не более 4–5 строк. Не пиши длинные абзацы.\n"
                     "Не упоминай имя файла — оно отображается отдельно. "
                     "Не выводи код, XML, JSON, HTML, сырые строки таблиц. "
@@ -1646,7 +1659,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Генерируем LLM-саммари для блока "Содержит:"
             _zip_llm_summary = await _generate_caption_summary(raw_text, file_name)
 
-            # Строим сводку по шаблону (без пустых строк между пунктами)
+            # Строим сводку по шаблону — plain text (без Markdown-разметки)
             _summary_lines = [
                 f"📦 Архив: `{file_name}` (Обработано: {_processed} из {_total})",
             ]
@@ -1656,7 +1669,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _summary_lines.append(f"Тип файлов: {', '.join(_type_labels)}")
             if _unsupported:
                 _unsupported_str = ", ".join(f"`{n}`" for n in _unsupported)
-                _summary_lines.append(f"Не обработаны (формат не поддерживается): {_unsupported_str}")
+                _summary_lines.append(f"Не обработано (формат не поддерживается): {_unsupported_str}")
             if _zip_llm_summary:
                 _summary_lines.append(f"Содержит: {_zip_llm_summary}")
 
