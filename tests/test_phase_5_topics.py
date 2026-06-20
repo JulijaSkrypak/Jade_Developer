@@ -550,18 +550,18 @@ class TestBuildCaption(unittest.TestCase):
         self.assertEqual(result, "")
 
     def test_with_extracted_text_uses_soderzhit_prefix(self):
-        """extracted_text теперь выводится с префиксом 'Содержит:'"""
+        """extracted_text выводится с префиксом '<b>Содержит:</b>' (Telegram HTML)."""
         result = self.router.build_caption("doc.txt", extracted_text="Привет мир")
         self.assertNotIn("doc.txt", result)
         self.assertIn("Привет мир", result)
-        self.assertIn("Содержит:", result)
+        self.assertIn("<b>Содержит:</b>", result)
 
     def test_long_text_still_under_1024(self):
         """Длинный саммари (до 600 символов) + префикс всё равно помещается в 1024."""
         long_text = "Б" * 600
         result = self.router.build_caption("file.txt", extracted_text=long_text)
         self.assertLessEqual(len(result), 1024)
-        self.assertIn("Содержит:", result)
+        self.assertIn("<b>Содержит:</b>", result)
 
     def test_with_metadata_sheets(self):
         result = self.router.build_caption("data.xlsx", metadata={"sheets": ["Sheet1", "Sheet2"]})
@@ -586,17 +586,17 @@ class TestBuildCaption(unittest.TestCase):
         self.assertNotIn("table.xlsx", result)
         self.assertIn("Q1", result)
         self.assertIn("Данные квартала", result)
-        self.assertIn("Содержит:", result)
+        self.assertIn("<b>Содержит:</b>", result)
 
     def test_archive_metadata_in_caption(self):
-        """Метаданные archive выводят '**[из архива: X]**' (жирный) без пустой строки между элементами."""
+        """Метаданные archive выводят '<b>из архива:</b> X'."""
         result = self.router.build_caption(
             "file.txt",
             extracted_text="Описание файла",
             metadata={"archive": "test.zip"},
         )
-        self.assertIn("**[из архива: test.zip]**", result)
-        self.assertIn("Содержит: Описание файла", result)
+        self.assertIn("<b>из архива:</b> test.zip", result)
+        self.assertIn("<b>Содержит:</b> Описание файла", result)
         # Проверяем отсутствие двойных пустых строк
         self.assertNotIn("\n\n", result)
 
@@ -888,7 +888,7 @@ class TestStatusMessageDeletionAndPrefixes(unittest.IsolatedAsyncioTestCase):
         self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1001) # Обрабатываю запрос...
 
         # Проверяем, что окончательный ответ содержит префикс 🎙️ и распознанный текст
-        self.mock_msg.reply_text.assert_any_call("🎙️ Тестовая речь\n\nАнализ ответа LLM")
+        self.mock_msg.reply_text.assert_any_call("🎙️ Тестовая речь\n\nАнализ ответа LLM", parse_mode="Markdown")
 
     @patch("bot.forward_to_topic", new_callable=AsyncMock)
     async def test_handle_photo_status_deletion_and_prefix(self, mock_forward):
@@ -948,7 +948,7 @@ class TestStatusMessageDeletionAndPrefixes(unittest.IsolatedAsyncioTestCase):
         self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1001)
 
         # Проверяем окончательный ответ с префиксом 📄
-        self.mock_msg.reply_text.assert_any_call("📄 [Документ: test.txt]\n\nСодержимое текстового файла\n\nАнализ документа")
+        self.mock_msg.reply_text.assert_any_call("📄 [Документ: test.txt]\n\nСодержимое текстового файла\n\nАнализ документа", parse_mode="Markdown")
 
 
 class TestShouldProcessMessage(unittest.TestCase):
@@ -1075,28 +1075,30 @@ class TestCallbackHandlers(unittest.IsolatedAsyncioTestCase):
         self.bot.DB_FILE = "test_jade_bridge.db"
         self.bot.init_db()
 
-        # Mock update and callback_query
         self.query = MagicMock()
         self.query.answer = AsyncMock()
         self.query.data = "ai_analyze:sonnet"
+        self.query.from_user.id = 777
         
         self.message = MagicMock()
         self.message.chat.id = -100123
         self.message.message_id = 456
         self.message.reply_text = AsyncMock()
         
-        # Переопределяем reply_text для возврата mock-сообщения
         self.analysis_msg = MagicMock()
-        self.analysis_msg.edit_text = AsyncMock()
-        self.message.reply_text.return_value = self.analysis_msg
+        self.analysis_msg.message_id = 300
+        
+        # В нашей реализации используется send_message для ForceReply
+        # с reply_to_message_id
+        self.bot_obj = MagicMock()
+        self.bot_obj.send_message = AsyncMock(return_value=self.analysis_msg)
         
         self.query.message = self.message
-
         self.update = MagicMock()
         self.update.callback_query = self.query
 
         self.context = MagicMock()
-        self.context.bot = MagicMock()
+        self.context.bot = self.bot_obj
         self.context.bot_data = {}
 
     def tearDown(self):
@@ -1106,7 +1108,7 @@ class TestCallbackHandlers(unittest.IsolatedAsyncioTestCase):
             os.remove("test_jade_bridge.db")
 
     async def test_callback_document_analysis(self):
-        """Callback отправляет 'Ваш запрос: ...?' в deferred-режиме."""
+        """Callback отправляет предложение задать вопрос с ForceReply."""
         self.bot.save_forwarded_file(
             chat_id=-100123,
             message_id=456,
@@ -1118,47 +1120,20 @@ class TestCallbackHandlers(unittest.IsolatedAsyncioTestCase):
 
         await self.bot.handle_ai_analyze_callback(self.update, self.context)
 
-        # Callback query завершён
         self.query.answer.assert_called_once()
-
-        # Вместо анализа — вопрос-опрос
-        self.message.reply_text.assert_called_once()
-        call_text = self.message.reply_text.call_args[0][0]
-        self.assertEqual(call_text, "Ваш запрос: ...?")
-        self.assertEqual(self.message.reply_text.call_args.kwargs.get("reply_to_message_id"), 456)
-
-        # Немедленный анализ НЕ запущен
-        self.analysis_msg.edit_text.assert_not_called()
-
-        # pending_analyses заполнен
-        self.assertIn("pending_analyses", self.context.bot_data)
-        entries = list(self.context.bot_data["pending_analyses"].values())
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["model_choice"], "sonnet")
-        self.assertEqual(entries[0]["file_message_id"], 456)
-
-    async def test_callback_video_returns_stub(self):
-        """Callback для видеокружочка тоже переходит в deferred-режим."""
-        self.bot.save_forwarded_file(
-            chat_id=-100123,
-            message_id=456,
-            file_id="video_id",
-            file_type="video_note",
-            file_name="circle.mp4"
-        )
-
-        await self.bot.handle_ai_analyze_callback(self.update, self.context)
-
-        # Callback query завершён
-        self.query.answer.assert_called_once()
-
-        # Вопрос-опрос отправлен
-        self.message.reply_text.assert_called_once()
-        call_text = self.message.reply_text.call_args[0][0]
-        self.assertEqual(call_text, "Ваш запрос: ...?")
-
-        # Анализ НЕ запущен немедленно
-        self.analysis_msg.edit_text.assert_not_called()
+        self.bot_obj.send_message.assert_called_once()
+        
+        call_kwargs = self.bot_obj.send_message.call_args.kwargs
+        self.assertEqual(call_kwargs["chat_id"], -100123)
+        self.assertIn("Claude Sonnet 4.6. Ваш вопрос:", call_kwargs["text"])
+        self.assertEqual(call_kwargs["reply_to_message_id"], 456)
+        
+        # Проверяем запись в БД
+        dialog = self.bot.get_file_dialog(-100123, 300)
+        self.assertIsNotNone(dialog)
+        self.assertEqual(dialog["file_message_id"], 456)
+        self.assertEqual(dialog["model_choice"], "sonnet")
+        self.assertEqual(dialog["history"], [])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1173,23 +1148,23 @@ class TestBuildCaptionArchiveTag(unittest.TestCase):
 
     def test_archive_tag_at_start(self):
         result = self.router.build_caption("report.pdf", metadata={"archive": "project.zip"})
-        self.assertTrue(result.startswith("**[из архива: project.zip]**"))
+        self.assertTrue(result.startswith("<b>из архива:</b> project.zip"))
 
     def test_archive_tag_at_start_no_filename(self):
         result = self.router.build_caption("doc.pdf", metadata={"archive": "test.zip"})
-        self.assertTrue(result.startswith("**[из архива: test.zip]**"))
+        self.assertTrue(result.startswith("<b>из архива:</b> test.zip"))
         self.assertNotIn("doc.pdf", result)
 
     def test_no_archive_tag_without_metadata(self):
         result = self.router.build_caption("doc.pdf")
-        self.assertNotIn("[из архива:", result)
+        self.assertNotIn("из архива:", result)
 
     def test_archive_and_sheets_together(self):
         result = self.router.build_caption(
             "data.xlsx",
             metadata={"archive": "bundle.zip", "sheets": ["Sheet1"]},
         )
-        self.assertIn("[из архива: bundle.zip]", result)
+        self.assertIn("<b>из архива:</b> bundle.zip", result)
         self.assertIn("Sheet1", result)
 
     def test_archive_with_extracted_text(self):
@@ -1198,7 +1173,7 @@ class TestBuildCaptionArchiveTag(unittest.TestCase):
             extracted_text="Текст файла",
             metadata={"archive": "docs.zip"},
         )
-        self.assertIn("[из архива: docs.zip]", result)
+        self.assertIn("<b>из архива:</b> docs.zip", result)
         self.assertNotIn("notes.txt", result)
         self.assertIn("Текст файла", result)
 
@@ -1446,11 +1421,11 @@ class TestShouldProcessMessageWithPendingAnalyses(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 21. handle_ai_analyze_callback — deferred режим (Задача 5)
+# 21. handle_ai_analyze_callback — диалоги в БД (Задача 5)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestCallbackDeferredMode(unittest.IsolatedAsyncioTestCase):
-    """Задача 5: handle_ai_analyze_callback отправляет 'Ваш запрос: ...?' не анализ."""
+    """Задача 5: handle_ai_analyze_callback отправляет предложение задать вопрос с ForceReply."""
 
     def setUp(self):
         import bot
@@ -1470,14 +1445,16 @@ class TestCallbackDeferredMode(unittest.IsolatedAsyncioTestCase):
         self.message = MagicMock()
         self.message.chat.id = -100123
         self.message.message_id = 456
-        self.message.reply_text = AsyncMock(return_value=self.question_msg)
 
         self.query.message = self.message
         self.update = MagicMock()
         self.update.callback_query = self.query
 
+        self.bot_obj = MagicMock()
+        self.bot_obj.send_message = AsyncMock(return_value=self.question_msg)
+
         self.context = MagicMock()
-        self.context.bot = MagicMock()
+        self.context.bot = self.bot_obj
         self.context.bot_data = {}
 
     def tearDown(self):
@@ -1494,38 +1471,45 @@ class TestCallbackDeferredMode(unittest.IsolatedAsyncioTestCase):
         await self.bot_module.handle_ai_analyze_callback(self.update, self.context)
 
         self.query.answer.assert_called_once()
-        self.message.reply_text.assert_called_once()
-        self.assertEqual(self.message.reply_text.call_args[0][0], "Ваш запрос: ...?")
+        self.bot_obj.send_message.assert_called_once()
+        call_kwargs = self.bot_obj.send_message.call_args.kwargs
+        self.assertIn("Claude Sonnet 4.6. Ваш вопрос:", call_kwargs["text"])
 
-    async def test_pending_analyses_populated_with_correct_metadata(self):
+    async def test_file_dialogs_populated_with_correct_metadata(self):
         self.bot_module.save_forwarded_file(
             chat_id=-100123, message_id=456,
             file_id="f_id", file_type="photo", file_name="img.jpg",
         )
         await self.bot_module.handle_ai_analyze_callback(self.update, self.context)
 
-        pending = self.context.bot_data.get("pending_analyses", {})
-        self.assertEqual(len(pending), 1)
-        entry = list(pending.values())[0]
-        self.assertEqual(entry["file_message_id"], 456)
-        self.assertEqual(entry["model_choice"], "sonnet")
-        self.assertEqual(entry["chat_id"], -100123)
+        dialog = self.bot_module.get_file_dialog(-100123, 300)
+        self.assertIsNotNone(dialog)
+        self.assertEqual(dialog["file_message_id"], 456)
+        self.assertEqual(dialog["model_choice"], "sonnet")
 
-    async def test_no_file_info_sends_warning_no_pending(self):
+    async def test_no_file_info_sends_warning_no_dialog(self):
         await self.bot_module.handle_ai_analyze_callback(self.update, self.context)
-        self.message.reply_text.assert_called_once()
-        self.assertIn("отсутствует в базе данных", self.message.reply_text.call_args[0][0])
-        self.assertNotIn("pending_analyses", self.context.bot_data)
+        self.bot_obj.send_message.assert_called_once()
+        call_text = self.bot_obj.send_message.call_args.kwargs.get("text", "")
+        self.assertIn("отсутствует в базе данных", call_text)
+        dialog = self.bot_module.get_file_dialog(-100123, 300)
+        self.assertIsNone(dialog)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 22. handle_text — перехват pending_analyses Reply (Задача 5)
+# 22. handle_text — перехват диалога по файлам (Задача 5)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestHandleTextDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
-    """Задача 5: handle_text запускает execute_deferred_analysis при Reply."""
+    """Задача 5: handle_text запускает execute_file_dialog_step при Reply."""
 
     def setUp(self):
+        import bot
+        self.bot_module = bot
+        self.original_db = bot.DB_FILE
+        self.bot_module.DB_FILE = "test_handle_text_dialog.db"
+        self.bot_module.init_db()
+
         self.bot_obj = MagicMock()
         self.bot_obj.delete_message = AsyncMock()
 
@@ -1548,36 +1532,40 @@ class TestHandleTextDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
         self.context = MagicMock()
         self.context.bot = self.bot_obj
         self.context.user_data = {}
-        self.context.bot_data = {
-            "pending_analyses": {
-                100: {
-                    "file_message_id": 50,
-                    "model_choice": "sonnet",
-                    "chat_id": 9999,
-                    "user_id": 1,
-                }
-            }
-        }
 
-    @patch("bot.execute_deferred_analysis", new_callable=AsyncMock)
-    async def test_text_reply_triggers_deferred_analysis(self, mock_exec):
+        # Создаем стартовый диалог в БД
+        self.bot_module.save_file_dialog(
+            chat_id=9999,
+            bot_message_id=100,
+            file_message_id=50,
+            model_choice="sonnet",
+            history_list=[],
+            user_id=1
+        )
+
+    def tearDown(self):
+        self.bot_module.DB_FILE = self.original_db
+        if os.path.exists("test_handle_text_dialog.db"):
+            os.remove("test_handle_text_dialog.db")
+
+    @patch("bot.execute_file_dialog_step", new_callable=AsyncMock)
+    async def test_text_reply_triggers_dialog_step(self, mock_exec):
         from bot import handle_text
         await handle_text(self.mock_update, self.context)
         mock_exec.assert_called_once()
         self.assertEqual(mock_exec.call_args[0][3], "Найди все даты в документе")
-        self.assertEqual(mock_exec.call_args[0][4], 100)
 
-    @patch("bot.execute_deferred_analysis", new_callable=AsyncMock)
+    @patch("bot.execute_file_dialog_step", new_callable=AsyncMock)
     async def test_pending_entry_removed_after_trigger(self, mock_exec):
         from bot import handle_text
         await handle_text(self.mock_update, self.context)
-        self.assertNotIn(100, self.context.bot_data["pending_analyses"])
+        dialog = self.bot_module.get_file_dialog(9999, 100)
+        self.assertIsNone(dialog)
 
-    @patch("bot.execute_deferred_analysis", new_callable=AsyncMock)
-    async def test_no_reply_to_message_skips_deferred(self, mock_exec):
+    @patch("bot.execute_file_dialog_step", new_callable=AsyncMock)
+    async def test_no_reply_to_message_skips_dialog(self, mock_exec):
         self.mock_msg.reply_to_message = None
         from bot import handle_text
-        # Normal flow — deferred NOT triggered
         with patch("bot.choose_model", new_callable=AsyncMock,
                    return_value=("google/gemini-3.5-flash", "text", "")):
             with patch("bot.ask_llm", new_callable=AsyncMock, return_value="ok"):
@@ -1586,13 +1574,19 @@ class TestHandleTextDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 23. handle_voice — перехват pending_analyses Reply (Задача 5)
+# 23. handle_voice — перехват диалога по файлам (Задача 5)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestHandleVoiceDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
-    """Задача 5: handle_voice распознаёт речь и запускает execute_deferred_analysis."""
+    """Задача 5: handle_voice распознаёт речь и запускает execute_file_dialog_step."""
 
     def setUp(self):
+        import bot
+        self.bot_module = bot
+        self.original_db = bot.DB_FILE
+        self.bot_module.DB_FILE = "test_handle_voice_dialog.db"
+        self.bot_module.init_db()
+
         self.bot_obj = MagicMock()
         self.bot_obj.delete_message = AsyncMock()
 
@@ -1623,18 +1617,23 @@ class TestHandleVoiceDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
         self.context = MagicMock()
         self.context.bot = self.bot_obj
         self.context.user_data = {}
-        self.context.bot_data = {
-            "pending_analyses": {
-                101: {
-                    "file_message_id": 51,
-                    "model_choice": "gemini",
-                    "chat_id": 9999,
-                    "user_id": 1,
-                }
-            }
-        }
 
-    @patch("bot.execute_deferred_analysis", new_callable=AsyncMock)
+        # Создаем стартовый диалог
+        self.bot_module.save_file_dialog(
+            chat_id=9999,
+            bot_message_id=101,
+            file_message_id=51,
+            model_choice="gemini",
+            history_list=[],
+            user_id=1
+        )
+
+    def tearDown(self):
+        self.bot_module.DB_FILE = self.original_db
+        if os.path.exists("test_handle_voice_dialog.db"):
+            os.remove("test_handle_voice_dialog.db")
+
+    @patch("bot.execute_file_dialog_step", new_callable=AsyncMock)
     @patch("bot.transcribe_audio", new_callable=AsyncMock, return_value="Текст из голоса")
     @patch("bot.os.remove")
     @patch("bot.tempfile.NamedTemporaryFile")
@@ -1652,12 +1651,11 @@ class TestHandleVoiceDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
         mock_exec.assert_called_once()
         self.assertEqual(mock_exec.call_args[0][3], "Текст из голоса")
 
-    @patch("bot.execute_deferred_analysis", new_callable=AsyncMock)
+    @patch("bot.execute_file_dialog_step", new_callable=AsyncMock)
     @patch("bot.transcribe_audio", new_callable=AsyncMock, return_value="Текст")
     @patch("bot.os.remove")
     @patch("bot.tempfile.NamedTemporaryFile")
     async def test_voice_deferred_deletes_recognizing_status(self, mock_tmp, mock_remove, mock_transcribe, mock_exec):
-        """Статус '🎙️ Распознаю голос...' отправляется и удаляется."""
         mock_file = MagicMock()
         mock_file.name = "tmp.ogg"
         mock_tmp.return_value.__enter__.return_value = mock_file
@@ -1669,115 +1667,81 @@ class TestHandleVoiceDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
         await handle_voice(self.mock_update, self.context)
 
         sent_texts = [text for _, text in self.sent_messages]
-        self.assertIn("🎙️ Распознаю голос...", sent_texts)
+        self.assertIn("Распознаю голос...", sent_texts)
         self.bot_obj.delete_message.assert_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 24. execute_deferred_analysis — статус и анализ (Задача 5)
+# 24. execute_file_dialog_step — статус и анализ (Задача 5)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestExecuteDeferredAnalysis(unittest.IsolatedAsyncioTestCase):
-    """Задача 5: execute_deferred_analysis отправляет статус и редактирует результатом."""
+class TestExecuteFileDialogStep(unittest.IsolatedAsyncioTestCase):
+    """Задача 5: execute_file_dialog_step отправляет статус и отвечает результатом."""
 
     def setUp(self):
         import bot
         self.bot_module = bot
         self.original_db = bot.DB_FILE
-        self.bot_module.DB_FILE = "test_exec_deferred.db"
+        self.bot_module.DB_FILE = "test_exec_dialog.db"
         self.bot_module.init_db()
 
-        self.status_msg = MagicMock()
-        self.status_msg.edit_text = AsyncMock()
-
-        self.bot_obj = MagicMock()
-        self.bot_obj.delete_message = AsyncMock()
-        self.bot_obj.send_message = AsyncMock(return_value=self.status_msg)
-        self.bot_obj.get_file = AsyncMock()
+        self.bot_reply_msg = MagicMock()
+        self.bot_reply_msg.message_id = 999
 
         self.mock_update = MagicMock()
         self.mock_update.message.message_id = 202
+        self.mock_update.effective_chat.id = 9999
+        self.mock_update.effective_user.id = 1
+        self.mock_update.message.reply_text = AsyncMock(return_value=self.bot_reply_msg)
+
+        self.bot_obj = MagicMock()
+        self.bot_obj.delete_message = AsyncMock()
+        self.bot_obj.get_file = AsyncMock()
 
         self.context = MagicMock()
         self.context.bot = self.bot_obj
-        self.context.bot_data = {}
 
     def tearDown(self):
         self.bot_module.DB_FILE = self.original_db
-        if os.path.exists("test_exec_deferred.db"):
-            os.remove("test_exec_deferred.db")
+        if os.path.exists("test_exec_dialog.db"):
+            os.remove("test_exec_dialog.db")
 
     @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="Результат анализа")
-    async def test_sends_status_and_edits_with_result(self, mock_ask):
+    async def test_sends_status_and_replies_with_result(self, mock_ask):
         self.bot_module.save_forwarded_file(
             chat_id=9999, message_id=50,
             file_id="doc_id", file_type="document",
             file_name="report.pdf", extracted_text="Содержимое отчёта",
         )
-        analysis_info = {
+        session = {
             "file_message_id": 50, "model_choice": "sonnet",
-            "chat_id": 9999, "user_id": 1,
+            "chat_id": 9999, "user_id": 1, "history": []
         }
-        from bot import execute_deferred_analysis
-        await execute_deferred_analysis(
-            self.mock_update, self.context, analysis_info, "Найди выводы", 100
+        from bot import execute_file_dialog_step
+        await execute_file_dialog_step(
+            self.mock_update, self.context, session, "Найди выводы"
         )
-        self.bot_obj.send_message.assert_called_once()
-        self.assertIn("Запуск глубокого анализа", self.bot_obj.send_message.call_args.kwargs["text"])
-        self.status_msg.edit_text.assert_called_once()
-        self.assertIn("Результат анализа", self.status_msg.edit_text.call_args[0][0])
-
-    async def test_deletes_question_and_user_messages(self):
-        """execute_deferred_analysis удаляет question_msg (100) и reply пользователя (202)."""
-        self.bot_module.save_forwarded_file(
-            chat_id=9999, message_id=50,
-            file_id="vid_id", file_type="video_note", file_name="circle.mp4",
-        )
-        analysis_info = {
-            "file_message_id": 50, "model_choice": "gemini",
-            "chat_id": 9999, "user_id": 1,
-        }
-        from bot import execute_deferred_analysis
-        await execute_deferred_analysis(
-            self.mock_update, self.context, analysis_info, "анализ", 100
-        )
-        deleted_ids = [c.kwargs.get("message_id") for c in self.bot_obj.delete_message.call_args_list]
-        self.assertIn(100, deleted_ids)
-        self.assertIn(202, deleted_ids)
+        self.assertEqual(self.mock_update.message.reply_text.call_count, 2)
+        
+        last_reply = self.mock_update.message.reply_text.call_args_list[1][0][0]
+        self.assertIn("<b>Claude Sonnet 4.6:</b>", last_reply)
+        self.assertIn("Результат анализа", last_reply)
 
     async def test_no_file_info_edits_status_with_warning(self):
-        """Если файл не найден в БД — статус редактируется с предупреждением."""
-        analysis_info = {
+        session = {
             "file_message_id": 9999, "model_choice": "sonnet",
-            "chat_id": 9999, "user_id": 1,
+            "chat_id": 9999, "user_id": 1, "history": []
         }
-        from bot import execute_deferred_analysis
-        await execute_deferred_analysis(
-            self.mock_update, self.context, analysis_info, "анализ", 100
+        status_msg = MagicMock()
+        status_msg.edit_text = AsyncMock()
+        self.mock_update.message.reply_text = AsyncMock(return_value=status_msg)
+        
+        from bot import execute_file_dialog_step
+        await execute_file_dialog_step(
+            self.mock_update, self.context, session, "анализ"
         )
-        self.status_msg.edit_text.assert_called_once()
-        self.assertIn("не найдена", self.status_msg.edit_text.call_args[0][0])
-
-    @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="Ответ на конкретный вопрос")
-    async def test_specific_query_includes_question_in_prompt(self, mock_ask):
-        """Конкретный запрос → вопрос пользователя включается в промпт."""
-        self.bot_module.save_forwarded_file(
-            chat_id=9999, message_id=50,
-            file_id="doc_id", file_type="document",
-            file_name="notes.txt", extracted_text="Большой текст документа",
-        )
-        analysis_info = {
-            "file_message_id": 50, "model_choice": "sonnet",
-            "chat_id": 9999, "user_id": 1,
-        }
-        from bot import execute_deferred_analysis
-        await execute_deferred_analysis(
-            self.mock_update, self.context, analysis_info,
-            "Сколько упоминаний слова 'риск'?", 100
-        )
-        mock_ask.assert_called_once()
-        prompt_content = mock_ask.call_args[0][0][1]["content"]
-        self.assertIn("Сколько упоминаний слова 'риск'?", prompt_content)
+        status_msg.edit_text.assert_called_once()
+        self.assertIn("не найдена", status_msg.edit_text.call_args[0][0])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1845,8 +1809,8 @@ class TestCaptionNoRawCode(unittest.TestCase):
     def test_llm_summary_passes_through_clean(self):
         summary = "Спецификация байдарок серии Щука и Налим с ценами и размерами"
         result = self.router.build_caption("spec.docx", extracted_text=summary)
-        # Новый формат: 'Содержит: <summary>'
-        self.assertIn("Содержит:", result)
+        # Формат Telegram HTML: '<b>Содержит:</b> <summary>'
+        self.assertIn("<b>Содержит:</b>", result)
         self.assertIn(summary, result)
 
     def test_filename_not_duplicated(self):
@@ -1860,7 +1824,7 @@ class TestCaptionNoRawCode(unittest.TestCase):
             metadata={"archive": "catalog.zip"},
         )
         self.assertNotIn("data.json", result)
-        self.assertIn("[из архива: catalog.zip]", result)
+        self.assertIn("<b>из архива:</b> catalog.zip", result)
         self.assertIn("JSON-спецификация продуктов", result)
 
     def test_empty_summary_gives_empty_caption(self):
@@ -2057,8 +2021,8 @@ class TestSystemPromptNoAiBoilerplate(unittest.TestCase):
 
 class TestBoldFormatting(unittest.TestCase):
     """
-    Тесты Markdown-форматирования в captions:
-    - Тег архива **[из архива: X]** — жирный
+    Тесты HTML-форматирования в captions (Telegram HTML):
+    - Тег архива <b>из архива:</b> X — жирный
     - Фото — подпись начинается с 📷 имя_файла
     - Форма parse_mode в forward_to_topic
     """
@@ -2067,26 +2031,22 @@ class TestBoldFormatting(unittest.TestCase):
         self.router = _reload_router()
 
     def test_archive_tag_is_bold(self):
-        """Тег архива выдаётся с двойными звёздочками (жирный Markdown)."""
+        """Тег архива выдаётся с тегом <b> (Telegram HTML)."""
         result = self.router.build_caption(
             "doc.txt",
             extracted_text="Описание",
             metadata={"archive": "data.zip"},
         )
-        self.assertIn("**[из архива: data.zip]**", result)
+        self.assertIn("<b>из архива:</b> data.zip", result)
 
     def test_archive_tag_no_plain_brackets(self):
-        """Не должно быть необрамлённого (plain) тега архива."""
+        """Тег архива содержит тег <b>, без квадратных скобок."""
         result = self.router.build_caption(
             "doc.txt",
             metadata={"archive": "data.zip"},
         )
-        # Должен быть жирный, но не плейн
-        self.assertIn("**", result)
-        # Проверяем, что звёздочки есть и до, и после скобок
-        idx = result.find("[")
-        self.assertTrue(idx > 1 and result[idx-2:idx] == "**",
-                        f"[из архива:...] должен начинаться с **: {result!r}")
+        self.assertIn("<b>из архива:</b>", result)
+        self.assertNotIn("[из архива:", result)
 
     def test_photo_caption_has_filename(self):
         """Для media_type='photo' caption начинается с '📷 имя_файла'."""
@@ -2100,17 +2060,16 @@ class TestBoldFormatting(unittest.TestCase):
         )
 
     def test_photo_from_archive_caption_has_both(self):
-        """Фото из архива: и 📷 имя, и **[из архива: X]**."""
+        """Фото из архива: и 📷 имя, и <b>из архива:</b> X (Telegram HTML)."""
         result = self.router.build_caption(
             "photo.png",
             metadata={"archive": "my_archive.zip"},
             media_type="photo",
         )
         self.assertIn("📷 photo.png", result)
-        self.assertIn("**[из архива: my_archive.zip]**", result)
-        # Имя должно быть выше тега архива
+        self.assertIn("<b>из архива:</b> my_archive.zip", result)
         idx_photo = result.find("📷")
-        idx_archive = result.find("**[")
+        idx_archive = result.find("<b>из архива:")
         self.assertLess(idx_photo, idx_archive, "📷 должно быть до тега архива")
 
     def test_document_type_no_filename_in_caption(self):
@@ -2120,12 +2079,11 @@ class TestBoldFormatting(unittest.TestCase):
             extracted_text="Описание",
             media_type="document",
         )
-        # Имя файла не должно быть в caption
         self.assertNotIn("report.pdf", result)
-        self.assertIn("Содержит: Описание", result)
+        self.assertIn("<b>Содержит:</b> Описание", result)
 
     def test_forward_to_topic_photo_sends_with_parse_mode(self):
-        """Пересылка фото через file_id — send_photo вызывается с parse_mode='Markdown'."""
+        """Пересылка фото через file_id — send_photo вызывается с parse_mode='HTML'."""
         mock_bot = MagicMock()
         mock_bot.send_photo = AsyncMock()
 
@@ -2139,10 +2097,10 @@ class TestBoldFormatting(unittest.TestCase):
 
         mock_bot.send_photo.assert_called_once()
         kwargs = mock_bot.send_photo.call_args.kwargs
-        self.assertEqual(kwargs.get("parse_mode"), "Markdown")
+        self.assertEqual(kwargs.get("parse_mode"), "HTML")
 
     def test_forward_to_topic_document_sends_with_parse_mode(self):
-        """Пересылка документа через file_id — send_document вызывается с parse_mode='Markdown'."""
+        """Пересылка документа через file_id — send_document вызывается с parse_mode='HTML'."""
         mock_bot = MagicMock()
         mock_bot.send_document = AsyncMock()
 
@@ -2157,7 +2115,7 @@ class TestBoldFormatting(unittest.TestCase):
 
         mock_bot.send_document.assert_called_once()
         kwargs = mock_bot.send_document.call_args.kwargs
-        self.assertEqual(kwargs.get("parse_mode"), "Markdown")
+        self.assertEqual(kwargs.get("parse_mode"), "HTML")
 
     def test_photo_caption_contains_filename_even_without_metadata(self):
         """Для media_type='photo' caption содержит имя даже без extracted_text и metadata."""
@@ -2168,12 +2126,104 @@ class TestBoldFormatting(unittest.TestCase):
         self.assertEqual(result, "📷 ph_0620_1423.jpg")
 
     def test_caption_summary_prompt_uses_bold_vklucheno(self):
-        """Промпт _generate_caption_summary инструктирует LLM писать **Включено**: (с звёздочками)."""
+        """Промпт _generate_caption_summary инструктирует LLM писать *Включено*:."""
         import inspect
         import bot
         source = inspect.getsource(bot._generate_caption_summary)
-        self.assertIn("**Включено**", source,
-                      "Промпт должен содержать **Включено**: для Markdown-рендеринга")
+        self.assertIn("*Включено*", source)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# БАГ-ФИКС: parse_mode="Markdown" в немедленных ответах-анализах документа
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestHandleDocumentParseMode(unittest.IsolatedAsyncioTestCase):
+    """
+    Проверяет, что handle_document (немедленный ответ в топике Jade)
+    вызывает reply_text с parse_mode="Markdown", чтобы **Назначение:**,
+    **Ключевая тема:** и аналогичные метки рендерились жирным, а не
+    отображались буквальными звёздочками.
+    """
+
+    async def test_handle_document_reply_has_markdown_parse_mode(self):
+        """
+        Основной код-путь: документ .docx → LLM отвечает → reply_text с parse_mode="Markdown".
+        """
+        import bot
+
+        # ── Мокируем update ──────────────────────────────────────────────────
+        mock_update = MagicMock()
+        mock_update.effective_user.is_bot = False
+        mock_update.effective_chat.type = "private"
+        mock_update.effective_chat.id = 11111
+        mock_update.effective_user.id = 22222
+
+        mock_doc = MagicMock()
+        mock_doc.file_name = "test_docx.docx"
+        mock_doc.mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        mock_doc.file_size = 5000
+        mock_doc.file_id = "docx_fake_file_id"
+        mock_update.message.document = mock_doc
+        mock_update.message.caption = ""
+        mock_update.message.reply_to_message = None
+
+        # Собираем все вызовы reply_text
+        reply_calls = []
+
+        async def capture_reply(text, **kwargs):
+            reply_calls.append({"text": text, "kwargs": kwargs})
+            m = MagicMock()
+            m.message_id = len(reply_calls)
+            return m
+
+        mock_update.message.reply_text = capture_reply
+
+        # ── Мокируем context ─────────────────────────────────────────────────
+        mock_context = MagicMock()
+        mock_context.user_data = {}
+        mock_context.bot_data = {}
+
+        fake_tg_file = MagicMock()
+        fake_tg_file.download_to_drive = AsyncMock()
+        mock_context.bot.get_file = AsyncMock(return_value=fake_tg_file)
+        mock_context.bot.delete_message = AsyncMock()
+
+        fake_doc_text = "Это тестовый документ с важными данными."
+
+        async def fake_forward(*args, **kwargs):
+            return MagicMock(message_id=999)
+
+        llm_reply = (
+            "**Назначение:** тестовый документ\n"
+            "**Ключевая тема:** проверка\n"
+            "**Содержимое для поиска:** данные"
+        )
+
+        # Патчим bot.os.remove, чтобы не падать на попытке удалить tmp-файл
+        with patch.object(bot, "extract_text_from_docx", return_value=fake_doc_text), \
+             patch.object(bot, "forward_to_topic", side_effect=fake_forward), \
+             patch.object(bot, "_generate_caption_summary", new=AsyncMock(return_value="Краткое описание")), \
+             patch.object(bot, "ask_llm", new=AsyncMock(return_value=llm_reply)), \
+             patch.object(bot, "choose_model", new=AsyncMock(return_value=("google/gemini-3.5-flash", fake_doc_text, ""))), \
+             patch("bot.os.remove"):
+            await bot.handle_document(mock_update, mock_context)
+
+        # ── Проверяем, что среди всех reply_text был вызов с parse_mode ──────
+        final_llm_calls = [
+            c for c in reply_calls
+            if llm_reply in c["text"] or "**" in c["text"]
+        ]
+        self.assertTrue(
+            len(final_llm_calls) > 0,
+            f"Ожидался reply_text с LLM-ответом (markdown). Все вызовы: {reply_calls}"
+        )
+        for call in final_llm_calls:
+            self.assertEqual(
+                call["kwargs"].get("parse_mode"), "Markdown",
+                f"reply_text с LLM-ответом должен иметь parse_mode='Markdown'. "
+                f"Текст: {call['text'][:80]!r}, kwargs: {call['kwargs']}"
+            )
 
 
 if __name__ == "__main__":

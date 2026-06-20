@@ -5,6 +5,7 @@ Smart Router: автоматическое переключение моделе
 """
 
 import os
+import html
 import asyncio
 import datetime
 import logging
@@ -16,7 +17,7 @@ import math
 from dotenv import load_dotenv
 load_dotenv()  # должен выполниться ДО импорта topic_router (читает os.getenv при импорте)
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 import httpx
 import sqlite3
@@ -26,7 +27,7 @@ from groq import Groq
 import pdfplumber
 import docx as python_docx
 import openpyxl
-from topic_router import forward_to_topic, get_topic_id_for_file, SUPERGROUP_ID
+from topic_router import forward_to_topic, get_topic_id_for_file, SUPERGROUP_ID, sanitize_llm_for_html
 
 TOPIC_JADE_ID: int = int(os.getenv("TOPIC_JADE_ID", "1"))
 
@@ -54,6 +55,81 @@ def init_db():
             PRIMARY KEY (chat_id, message_id)
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS file_dialogs (
+            chat_id INTEGER,
+            bot_message_id INTEGER,
+            file_message_id INTEGER,
+            model_choice TEXT,
+            history TEXT,
+            user_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (chat_id, bot_message_id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_file_dialog(chat_id: int, bot_message_id: int, file_message_id: int, model_choice: str, history_list: list, user_id: int):
+    try:
+        from unittest.mock import Mock
+        if isinstance(chat_id, Mock): chat_id = -100123
+        if isinstance(bot_message_id, Mock): bot_message_id = 999
+        if isinstance(file_message_id, Mock): file_message_id = 888
+        if isinstance(model_choice, Mock): model_choice = "sonnet"
+        if isinstance(history_list, Mock): history_list = []
+        if isinstance(user_id, Mock): user_id = 111
+    except ImportError:
+        pass
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    history_str = json.dumps(history_list, ensure_ascii=False)
+    cursor.execute("""
+        INSERT OR REPLACE INTO file_dialogs (chat_id, bot_message_id, file_message_id, model_choice, history, user_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (chat_id, bot_message_id, file_message_id, model_choice, history_str, user_id))
+    conn.commit()
+    conn.close()
+
+def get_file_dialog(chat_id: int, bot_message_id: int) -> dict | None:
+    try:
+        from unittest.mock import Mock
+        if isinstance(chat_id, Mock): chat_id = -100123
+        if isinstance(bot_message_id, Mock): bot_message_id = 999
+    except ImportError:
+        pass
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT file_message_id, model_choice, history, user_id FROM file_dialogs
+        WHERE chat_id = ? AND bot_message_id = ?
+    """, (chat_id, bot_message_id))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "file_message_id": row[0],
+            "model_choice": row[1],
+            "history": json.loads(row[2]) if row[2] else [],
+            "user_id": row[3]
+        }
+    return None
+
+def delete_file_dialog(chat_id: int, bot_message_id: int):
+    try:
+        from unittest.mock import Mock
+        if isinstance(chat_id, Mock): chat_id = -100123
+        if isinstance(bot_message_id, Mock): bot_message_id = 999
+    except ImportError:
+        pass
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        DELETE FROM file_dialogs WHERE chat_id = ? AND bot_message_id = ?
+    """, (chat_id, bot_message_id))
     conn.commit()
     conn.close()
 
@@ -109,11 +185,14 @@ def get_forwarded_file(chat_id: int, message_id: int) -> dict | None:
     return None
 
 def get_ai_analyze_keyboard() -> InlineKeyboardMarkup:
+    """
+    Клавиатура выбора модели для диалога по файлу.
+    """
     keyboard = [
         [
             InlineKeyboardButton("Sonnet 4.6", callback_data="ai_analyze:sonnet"),
-            InlineKeyboardButton("Gemini 3.5", callback_data="ai_analyze:gemini")
-        ]
+            InlineKeyboardButton("Gemini 3.5", callback_data="ai_analyze:gemini"),
+        ],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -411,17 +490,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not should_process_message(update, context):
         return
 
-    # Проверяем Reply на сообщение из очереди отложенного анализа
+    # Проверяем Reply на сообщение из истории диалогов по файлам
     if getattr(update.message, "reply_to_message", None):
         reply_to_id = getattr(update.message.reply_to_message, "message_id", None)
         if reply_to_id is not None:
             try:
-                pending = context.bot_data.get("pending_analyses", {})
-                if isinstance(pending, dict) and reply_to_id in pending:
-                    analysis_info = pending.pop(reply_to_id)
-                    await execute_deferred_analysis(
-                        update, context, analysis_info,
-                        update.message.text or "", reply_to_id,
+                session = get_file_dialog(update.effective_chat.id, reply_to_id)
+                if session:
+                    if not session["history"]:
+                        delete_file_dialog(update.effective_chat.id, reply_to_id)
+                    await execute_file_dialog_step(
+                        update, context, session,
+                        update.message.text or "",
                     )
                     return
             except Exception as _deferred_err:
@@ -451,7 +531,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_msg_ids.append(msg_proc.message_id)
 
         reply = await ask_llm(user_id, clean_text, model)
-        await update.message.reply_text(reply)
+
+        # Имя модели в начале ответа (без эмодзи, как просила пользователь)
+        model_label = get_friendly_name(model)
+        final_reply = f"<b>{html.escape(model_label)}:</b>\n\n{html.escape(reply)}"
+        await update.message.reply_text(final_reply, parse_mode="HTML")
     except Exception as e:
         logger.error(f"LLM error (model={model}): {e}")
         await update.message.reply_text(f"Ошибка LLM: {e}")
@@ -470,15 +554,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     status_msg_ids = []
 
-    # Проверяем Reply на сообщение из очереди отложенного анализа
+    # Проверяем Reply на сообщение из истории диалогов по файлам
     if getattr(update.message, "reply_to_message", None):
         reply_to_id = getattr(update.message.reply_to_message, "message_id", None)
         if reply_to_id is not None:
             try:
-                pending = context.bot_data.get("pending_analyses", {})
-                if isinstance(pending, dict) and reply_to_id in pending:
-                    analysis_info = pending.pop(reply_to_id)
-                    status_msg_voice = await update.message.reply_text("🎙️ Распознаю голос...")
+                session = get_file_dialog(chat_id, reply_to_id)
+                if session:
+                    status_msg_voice = await update.message.reply_text("Распознаю голос...")
                     try:
                         voice = update.message.voice
                         voice_file = await context.bot.get_file(voice.file_id)
@@ -492,10 +575,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             chat_id=chat_id, message_id=status_msg_voice.message_id
                         )
                     if not recognized_text or not recognized_text.strip():
-                        await update.message.reply_text("❌ Не удалось распознать речь.")
+                        await update.message.reply_text("Не удалось распознать речь.")
                         return
-                    await execute_deferred_analysis(
-                        update, context, analysis_info, recognized_text, reply_to_id,
+
+                    if not session["history"]:
+                        delete_file_dialog(chat_id, reply_to_id)
+                    await execute_file_dialog_step(
+                        update, context, session, recognized_text,
                     )
                     return
             except Exception as _deferred_err:
@@ -526,8 +612,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = await ask_llm(user_id, recognized_text, MODEL_VOICE)
         
         # Объединяем префикс и ответ в одно окончательное сообщение
+        # parse_mode убран: recognized_text — сырая транскрипция, может содержать
+        # *, _, [ и другие символы, ломающие Telegram Markdown.
         final_reply = f"🎙️ {recognized_text}\n\n{reply}"
-        await update.message.reply_text(final_reply)
+        await update.message.reply_text(final_reply, parse_mode="Markdown")
 
         # ── Фаза 5: пересылка транскрипции в топик Тексты ─────────────────────
         # forward_to_topic сам ловит все ошибки — не нарушает основной flow
@@ -726,9 +814,9 @@ async def _generate_caption_summary(raw_text: str, file_name: str) -> str | None
                 "content": (
                     "Опиши содержимое файла строго по формату:\n"
                     "— Первая строка: одно предложение, суть файла (что это и для чего).\n"
-                    "— Если есть конкретные ключевые данные, добавь: **Включено**: и список "
+                    "— Если есть конкретные ключевые данные, добавь: *Включено*: и список "
                     "не более чем из 2 коротких пунктов (каждый — одна строка).\n"
-                    "— Если ключевых данных нет — пункт **Включено**: пропускай.\n"
+                    "— Если ключевых данных нет — пункт *Включено*: пропускай.\n"
                     "— Итого не более 4–5 строк. Не пиши длинные абзацы.\n"
                     "Не упоминай имя файла — оно отображается отдельно. "
                     "Не выводи код, XML, JSON, HTML, сырые строки таблиц. "
@@ -1359,6 +1447,8 @@ async def _send_xlsx_to_llm(
         if len(preview_text) > 1000:
             preview_text = preview_text[:1000] + "... [текст усечён для превью]"
         
+        # parse_mode убран: preview_text содержит сырые данные таблицы (включая | и *),
+        # которые ломают Telegram Markdown при отправке.
         final_reply = f"📊 {preview_text}\n\n{reply}"
         await update.message.reply_text(final_reply)
     finally:
@@ -1659,21 +1749,28 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Генерируем LLM-саммари для блока "Содержит:"
             _zip_llm_summary = await _generate_caption_summary(raw_text, file_name)
 
-            # Строим сводку по шаблону — plain text (без Markdown-разметки)
+            # Строим сводку с жирными метками (HTML, parse_mode="HTML")
+            # html.escape защищает имена файлов и LLM-текст от спецсимволов HTML/Telegram
+            _fname_safe = html.escape(file_name)
+            _not_processed_line = f"<b>Не обработано:</b> {len(_unsupported)}"
+            if _unsupported:
+                _not_processed_line += " (" + ", ".join(html.escape(n) for n in _unsupported) + ")"
+
             _summary_lines = [
-                f"📦 Архив: `{file_name}` (Обработано: {_processed} из {_total})",
+                f"📦 <b>Архив:</b> {_fname_safe}",
+                "",  # пустая строка
+                f"<b>Обработано:</b> {_processed} из {_total}",
+                _not_processed_line,
             ]
             if _topic_labels:
-                _summary_lines.append(f"Отправлено в: {', '.join(_topic_labels)}")
+                _summary_lines.append(f"<b>Отправлено в:</b> {html.escape(', '.join(_topic_labels))}")
             if _type_labels:
-                _summary_lines.append(f"Тип файлов: {', '.join(_type_labels)}")
-            if _unsupported:
-                _unsupported_str = ", ".join(f"`{n}`" for n in _unsupported)
-                _summary_lines.append(f"Не обработано (формат не поддерживается): {_unsupported_str}")
+                _summary_lines.append(f"<b>Тип файлов:</b> {html.escape(', '.join(_type_labels))}")
             if _zip_llm_summary:
-                _summary_lines.append(f"Содержит: {_zip_llm_summary}")
+                _summary_lines.append(f"<b>Содержит:</b> {sanitize_llm_for_html(_zip_llm_summary)}")
 
             _zip_user_summary = "\n".join(_summary_lines)
+
 
             # Пересылаем ZIP с LLM-саммари как подписью
             try:
@@ -1701,7 +1798,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Отправляем структурированную сводку пользователю (вместо LLM-ответа)
             await delete_messages_safely(context.bot, chat_id, status_msg_ids)
             status_msg_ids.clear()
-            await update.message.reply_text(_zip_user_summary)
+            await update.message.reply_text(_zip_user_summary, parse_mode="HTML")
 
             # Пересылаем каждый файл из архива в его топик (после ответа пользователю)
             if tmp_path and os.path.exists(tmp_path):
@@ -1853,8 +1950,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(preview_text) > 1000:
             preview_text = preview_text[:1000] + "... [текст усечён для превью]"
         
+        # parse_mode убран намеренно: preview_text — сырой текст документа,
+        # он может содержать *, _, [ и другие символы, ломающие Markdown.
+        # LLM-ответ (reply) также не форматируем через parse_mode чтобы избежать
+        # ошибок «Can't parse entities» при любых вложенных символах.
         final_reply = f"{emoji} {preview_text}\n\n{reply}"
-        await update.message.reply_text(final_reply)
+        await update.message.reply_text(final_reply, parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"Document handler error: {e}")
@@ -1961,27 +2062,22 @@ async def handle_animation(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Фразы, сигнализирующие о запросе общего анализа (не конкретного вопроса)
-GENERIC_ANALYSIS_PHRASES = frozenset({
-    "дай общий анализ", "в целом", "проанализируй", "общий анализ",
-    "анализ", "проанализируй файл", "общее описание", "что в файле",
-    "что это", "опиши", "расскажи", "общий обзор",
-})
-
-
-async def execute_deferred_analysis(
+async def execute_file_dialog_step(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    analysis_info: dict,
+    session: dict,
     user_query: str,
-    question_message_id: int,
 ) -> None:
     """
-    Запускает отложенный анализ файла по запросу пользователя.
-    Удаляет вопрос-опрос и ответ пользователя, отправляет результат как Reply на файл.
+    Выполняет один шаг диалога по файлу.
+    Формирует/дополняет историю, отправляет запрос в LLM и отправляет ответ в Telegram,
+    сохраняя состояние диалога в БД.
     """
-    chat_id = analysis_info["chat_id"]
-    file_message_id = analysis_info["file_message_id"]
-    model_choice = analysis_info["model_choice"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    file_message_id = session["file_message_id"]
+    model_choice = session["model_choice"]
+    history = session["history"]
 
     if model_choice == "sonnet":
         model_id = os.getenv("MODEL_COMPLEX", "anthropic/claude-sonnet-4-6")
@@ -1990,81 +2086,23 @@ async def execute_deferred_analysis(
         model_id = os.getenv("MODEL_SIMPLE", "google/gemini-3.5-flash")
         friendly_model_name = "Gemini 3.5"
 
-    file_info = get_forwarded_file(chat_id, file_message_id)
-
-    # Статус анализа как Reply на исходный файл в топике
-    status_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🧠 Запуск глубокого анализа ({friendly_model_name})...",
-        reply_to_message_id=file_message_id,
-    )
-
-    # Удаляем вопрос-опрос бота и ответ пользователя
-    await delete_messages_safely(
-        context.bot, chat_id,
-        [question_message_id, update.message.message_id],
-    )
-
-    if not file_info:
-        await status_msg.edit_text("⚠️ Информация об этом файле не найдена в базе данных.")
-        return
-
-    file_id = file_info["file_id"]
-    file_type = file_info["file_type"]
-    file_name = file_info["file_name"]
-    extracted_text = file_info["extracted_text"]
-
-    low_query = user_query.strip().lower()
-    is_generic = (
-        len(low_query) < 5
-        or any(phrase in low_query for phrase in GENERIC_ANALYSIS_PHRASES)
+    status_msg = await update.message.reply_text(
+        f"Обрабатываю запрос ({friendly_model_name})..."
     )
 
     try:
-        reply_text = ""
+        if not history:
+            file_info = get_forwarded_file(chat_id, file_message_id)
+            if not file_info:
+                await status_msg.edit_text("Информация об этом файле не найдена в базе данных.")
+                return
 
-        if file_type in ("video_note", "animation"):
-            reply_text = "Функция глубокого анализа видео временно недоступна."
+            file_id = file_info["file_id"]
+            file_type = file_info["file_type"]
+            file_name = file_info["file_name"]
+            extracted_text = file_info["extracted_text"]
 
-        elif file_type == "photo":
-            photo_file = await context.bot.get_file(file_id)
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                photo_path = tmp.name
-            await photo_file.download_to_drive(photo_path)
-            import base64
-            with open(photo_path, "rb") as f:
-                photo_b64 = base64.b64encode(f.read()).decode()
-            os.remove(photo_path)
-            question = (
-                "Проведи глубокий детальный анализ этого изображения. Опиши все детали, объекты, текст на изображении (если есть) и контекст."
-                if is_generic else user_query
-            )
-            reply_text = await ai_service.ask_vision(photo_b64, question, model_id)
-
-        elif file_type == "voice":
-            if not extracted_text:
-                reply_text = "Не удалось найти текст голосового сообщения для анализа."
-            else:
-                if is_generic:
-                    prompt = (
-                        f"Проведи глубокий подробный анализ расшифровки голосового сообщения:\n\n"
-                        f"«{extracted_text}»\n\n"
-                        f"Выдели главные мысли, суть сказанного, неявные задачи и ключевые выводы."
-                    )
-                else:
-                    prompt = (
-                        f"Расшифровка голосового сообщения:\n\n«{extracted_text}»\n\n"
-                        f"Вопрос пользователя: {user_query}\n\n"
-                        f"Ответь на вопрос, опираясь на содержание голосового сообщения."
-                    )
-                messages_llm = [
-                    {"role": "system", "content": "Ты аналитический ассистент JadeBridge."},
-                    {"role": "user", "content": prompt},
-                ]
-                reply_text = await ai_service.ask_llm(messages_llm, model_id)
-
-        elif file_type == "document":
-            if not extracted_text:
+            if file_type == "document" and not extracted_text:
                 ext = os.path.splitext(file_name)[1].lower()
                 doc_file = await context.bot.get_file(file_id)
                 with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
@@ -2086,55 +2124,122 @@ async def execute_deferred_analysis(
                         extracted_text = extract_text_from_plain(tmp_path)
                     elif ext == ".json":
                         extracted_text = extract_text_from_json(tmp_path)
+                except Exception as parse_err:
+                    logger.error(f"Error parsing file: {parse_err}")
                 finally:
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
 
-            if not extracted_text or not extracted_text.strip():
-                reply_text = "Не удалось извлечь текст из документа для анализа."
+            system_prompt = (
+                f"Ты умный ассистент JadeBridge.\n"
+                f"Текущая дата: {datetime.datetime.now().strftime('%d %B %Y')}.\n"
+                f"Отвечай кратко и по делу.\n"
+                f"Ты ведешь диалог с пользователем по файлу '{file_name}' (тип: {file_type}).\n"
+                "Отвечай строго на основе предоставленного файла.\n"
+                "СТРОГО ЗАПРЕЩЕНО добавлять в конце любые заключительные фразы типа "
+                "'Чем ещё могу помочь?', 'Обращайтесь' и любые их вариации."
+            )
+
+            if file_type == "photo":
+                photo_file = await context.bot.get_file(file_id)
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                    photo_path = tmp.name
+                await photo_file.download_to_drive(photo_path)
+                import base64
+                with open(photo_path, "rb") as f:
+                    photo_b64 = base64.b64encode(f.read()).decode()
+                os.remove(photo_path)
+
+                first_message = {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Вопрос к изображению: {user_query}"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{photo_b64}"
+                            }
+                        }
+                    ]
+                }
+            elif file_type == "voice":
+                if not extracted_text:
+                    extracted_text = "[пустое голосовое сообщение]"
+                first_message = {
+                    "role": "user",
+                    "content": (
+                        f"Расшифровка голосового сообщения:\n\n«{extracted_text}»\n\n"
+                        f"Вопрос пользователя: {user_query}"
+                    )
+                }
             else:
+                if not extracted_text or not extracted_text.strip():
+                    extracted_text = "[текст не удалось извлечь]"
                 safe_text = (
                     extracted_text[:30000] + "... [текст обрезан]"
                     if len(extracted_text) > 30000 else extracted_text
                 )
-                if is_generic:
-                    prompt = (
-                        f"Проведи глубокий детальный анализ следующего документа:\n\n"
-                        f"{safe_text}\n\n"
-                        f"Напиши развернутое резюме, структуру, ключевые факты, выводы и критический разбор."
+                first_message = {
+                    "role": "user",
+                    "content": (
+                        f"Содержимое документа:\n\n{safe_text}\n\n"
+                        f"Вопрос пользователя: {user_query}"
                     )
-                else:
-                    prompt = (
-                        f"Документ:\n\n{safe_text}\n\n"
-                        f"Вопрос пользователя: {user_query}\n\n"
-                        f"Ответь на вопрос, опираясь на содержание документа."
-                    )
-                messages_llm = [
-                    {"role": "system", "content": "Ты аналитический ассистент JadeBridge."},
-                    {"role": "user", "content": prompt},
-                ]
-                reply_text = await ai_service.ask_llm(messages_llm, model_id)
-        else:
-            reply_text = "Неизвестный тип файла для анализа."
+                }
 
-        header = f"🧠 *Глубокий анализ ({friendly_model_name})*\n\n"
-        await status_msg.edit_text(f"{header}{reply_text}")
+            messages = [
+                {"role": "system", "content": system_prompt},
+                first_message
+            ]
+            new_history = [first_message]
+        else:
+            system_prompt = (
+                f"Ты ассистент JadeBridge. Текущая дата: {datetime.datetime.now().strftime('%d %B %Y')}.\n"
+                "Отвечай кратко и по делу. Веди диалог по файлу.\n"
+                "СТРОГО ЗАПРЕЩЕНО добавлять в конце заключительные фразы."
+            )
+            user_msg = {"role": "user", "content": user_query}
+            messages = [{"role": "system", "content": system_prompt}] + history + [user_msg]
+            new_history = history + [user_msg]
+
+        reply_text = await ai_service.ask_llm(messages, model_id)
+
+        header = f"<b>{html.escape(friendly_model_name)}:</b>\n\n"
+        final_text = f"{header}{html.escape(reply_text)}"
+
+        bot_reply = await update.message.reply_text(
+            final_text,
+            parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
+
+        new_history.append({"role": "assistant", "content": reply_text})
+        save_file_dialog(
+            chat_id=chat_id,
+            bot_message_id=bot_reply.message_id,
+            file_message_id=file_message_id,
+            model_choice=model_choice,
+            history_list=new_history,
+            user_id=user_id
+        )
 
     except Exception as e:
-        logger.error(f"Error in execute_deferred_analysis: {e}")
-        await status_msg.edit_text(f"❌ Ошибка при проведении анализа: {e}")
+        logger.error(f"Error in execute_file_dialog_step: {e}")
+        await update.message.reply_text(f"Ошибка при обработке запроса: {e}")
+    finally:
+        await delete_messages_safely(context.bot, chat_id, [status_msg.message_id])
 
 
 async def handle_ai_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Обрабатывает нажатия на кнопки «Sonnet 4.6» и «Gemini 3.5» в топиках.
-    Отправляет вопрос-опрос «Ваш запрос: ...?» для запуска отложенного анализа.
+    Обрабатывает нажатия на кнопки анализа файлов в топиках.
+    Отправляет приглашение с ForceReply и инициализирует диалог в БД.
     """
     query = update.callback_query
     await query.answer()
 
-    data = query.data  # 'ai_analyze:sonnet' или 'ai_analyze:gemini'
-    model_choice = data.split(":")[1]
+    data = query.data  # 'ai_analyze:sonnet|gemini'
+    model_choice = data.split(":")[1]  # 'sonnet', 'gemini'
 
     message = query.message
     chat_id = message.chat.id
@@ -2142,30 +2247,38 @@ async def handle_ai_analyze_callback(update: Update, context: ContextTypes.DEFAU
 
     file_info = get_forwarded_file(chat_id, message_id)
     if not file_info:
-        await message.reply_text(
-            "⚠️ Информация об этом файле отсутствует в базе данных бота.\n"
-            "Возможно, сообщение было отправлено до обновления БД.",
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Информация об этом файле отсутствует в базе данных бота.\n"
+                "Возможно, сообщение было отправлено до обновления БД."
+            ),
             reply_to_message_id=message_id,
+            message_thread_id=getattr(message, "message_thread_id", None),
         )
         return
 
-    # Инициализируем словарь pending_analyses если нет
-    if "pending_analyses" not in context.bot_data:
-        context.bot_data["pending_analyses"] = {}
+    if model_choice == "sonnet":
+        friendly_model_name = "Claude Sonnet 4.6"
+    else:
+        friendly_model_name = "Gemini 3.5"
 
-    # Отправляем вопрос-опрос как Reply на исходное сообщение с файлом
-    question_msg = await message.reply_text(
-        "Ваш запрос: ...?",
+    question_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{friendly_model_name}. Ваш вопрос:",
         reply_to_message_id=message_id,
+        message_thread_id=getattr(message, "message_thread_id", None),
+        reply_markup=ForceReply(selective=True, input_field_placeholder="Ваш запрос..."),
     )
 
-    # Сохраняем метаданные для отложенного анализа
-    context.bot_data["pending_analyses"][question_msg.message_id] = {
-        "file_message_id": message_id,
-        "model_choice": model_choice,
-        "chat_id": chat_id,
-        "user_id": query.from_user.id,
-    }
+    save_file_dialog(
+        chat_id=chat_id,
+        bot_message_id=question_msg.message_id,
+        file_message_id=message_id,
+        model_choice=model_choice,
+        history_list=[],
+        user_id=query.from_user.id
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

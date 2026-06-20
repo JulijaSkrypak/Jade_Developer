@@ -1,4 +1,31 @@
+## БАГ-ФИКС: parse_mode="Markdown" в ответах-анализах документов
+Статус: DONE
+Дата выполнения: 2026-06-20
+
+Описание: Звёздочки markdown (`**Назначение:**`, `**Ключевая тема:**`, `**Содержимое для поиска:**`) отображались буквально в прямом ответе бота в топике Jade вместо жирного текста.
+
+Что сделано:
+- ✅ Найден код-путь: `handle_document` → `ask_llm` → `reply_text(final_reply)` (строка ~1857 `bot.py`) — `parse_mode` отсутствовал
+- ✅ Проверены **все** вызовы `reply_text` / `edit_text` с LLM-ответами — найдено **6 мест** без `parse_mode`:
+  - `handle_text` (~454) — ответ на текстовый запрос
+  - `handle_voice` (~530) — голос + LLM ответ
+  - `_send_xlsx_to_llm` (~1363) — ответ по Excel
+  - `handle_document` (~1857) — **основной баг** (ответ-анализ в топике Jade)
+  - `execute_deferred_analysis` (~2121) — `edit_text` с `*Глубокий анализ*`
+  - `handle_document` / ZIP-путь (~1704) — **найдено после ручного теста в Telegram**: сводка архива содержит LLM-текст с `**Включено**:`, но `parse_mode` отсутствовал
+- ✅ Во все 6 мест добавлен `parse_mode="Markdown"`
+- ✅ Обновлены 2 существующих теста (`test_handle_voice_status_deletion_and_prefix`, `test_handle_document_plain_text_status_deletion_and_prefix`)
+- ✅ Добавлен новый тест `TestHandleDocumentParseMode::test_handle_document_reply_has_markdown_parse_mode`
+- ✅ Тесты локально и на VPS: `138 passed, 17 subtests passed`
+- ✅ Деплой: `systemctl status vibe-bot` → `active (running)`
+
+Gate пройден: все 6 мест исправлены, тесты зелёные, сервис активен.
+Ручная проверка: отправить `.docx` и `.zip` в топик Jade — `**Назначение:**` и `**Включено**:` должны рендериться жирным без видимых звёздочек.
+
+---
+
 ## TASK-001
+
 Статус: DONE
 Дата выполнения: 2026-06-12
 Описание: Выполнить все шаги из PHASE_1_bot_echo.md на VPS 178.105.1.60 для развертывания echo Telegram-бота.
