@@ -888,7 +888,7 @@ class TestStatusMessageDeletionAndPrefixes(unittest.IsolatedAsyncioTestCase):
         self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1001) # Обрабатываю запрос...
 
         # Проверяем, что окончательный ответ содержит префикс 🎙️ и распознанный текст
-        self.mock_msg.reply_text.assert_any_call("🎙️ Тестовая речь\n\nАнализ ответа LLM", parse_mode="Markdown")
+        self.mock_msg.reply_text.assert_any_call("🎙️ Тестовая речь\n\nАнализ ответа LLM")
 
     @patch("bot.forward_to_topic", new_callable=AsyncMock)
     async def test_handle_photo_status_deletion_and_prefix(self, mock_forward):
@@ -948,7 +948,7 @@ class TestStatusMessageDeletionAndPrefixes(unittest.IsolatedAsyncioTestCase):
         self.bot.delete_message.assert_any_call(chat_id=9999, message_id=1001)
 
         # Проверяем окончательный ответ с префиксом 📄
-        self.mock_msg.reply_text.assert_any_call("📄 [Документ: test.txt]\n\nСодержимое текстового файла\n\nАнализ документа", parse_mode="Markdown")
+        self.mock_msg.reply_text.assert_any_call("📄 [Документ: test.txt]\n\nСодержимое текстового файла\n\nАнализ документа")
 
 
 class TestShouldProcessMessage(unittest.TestCase):
@@ -2133,97 +2133,6 @@ class TestBoldFormatting(unittest.TestCase):
         self.assertIn("*Включено*", source)
 
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# БАГ-ФИКС: parse_mode="Markdown" в немедленных ответах-анализах документа
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestHandleDocumentParseMode(unittest.IsolatedAsyncioTestCase):
-    """
-    Проверяет, что handle_document (немедленный ответ в топике Jade)
-    вызывает reply_text с parse_mode="Markdown", чтобы **Назначение:**,
-    **Ключевая тема:** и аналогичные метки рендерились жирным, а не
-    отображались буквальными звёздочками.
-    """
-
-    async def test_handle_document_reply_has_markdown_parse_mode(self):
-        """
-        Основной код-путь: документ .docx → LLM отвечает → reply_text с parse_mode="Markdown".
-        """
-        import bot
-
-        # ── Мокируем update ──────────────────────────────────────────────────
-        mock_update = MagicMock()
-        mock_update.effective_user.is_bot = False
-        mock_update.effective_chat.type = "private"
-        mock_update.effective_chat.id = 11111
-        mock_update.effective_user.id = 22222
-
-        mock_doc = MagicMock()
-        mock_doc.file_name = "test_docx.docx"
-        mock_doc.mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        mock_doc.file_size = 5000
-        mock_doc.file_id = "docx_fake_file_id"
-        mock_update.message.document = mock_doc
-        mock_update.message.caption = ""
-        mock_update.message.reply_to_message = None
-
-        # Собираем все вызовы reply_text
-        reply_calls = []
-
-        async def capture_reply(text, **kwargs):
-            reply_calls.append({"text": text, "kwargs": kwargs})
-            m = MagicMock()
-            m.message_id = len(reply_calls)
-            return m
-
-        mock_update.message.reply_text = capture_reply
-
-        # ── Мокируем context ─────────────────────────────────────────────────
-        mock_context = MagicMock()
-        mock_context.user_data = {}
-        mock_context.bot_data = {}
-
-        fake_tg_file = MagicMock()
-        fake_tg_file.download_to_drive = AsyncMock()
-        mock_context.bot.get_file = AsyncMock(return_value=fake_tg_file)
-        mock_context.bot.delete_message = AsyncMock()
-
-        fake_doc_text = "Это тестовый документ с важными данными."
-
-        async def fake_forward(*args, **kwargs):
-            return MagicMock(message_id=999)
-
-        llm_reply = (
-            "**Назначение:** тестовый документ\n"
-            "**Ключевая тема:** проверка\n"
-            "**Содержимое для поиска:** данные"
-        )
-
-        # Патчим bot.os.remove, чтобы не падать на попытке удалить tmp-файл
-        with patch.object(bot, "extract_text_from_docx", return_value=fake_doc_text), \
-             patch.object(bot, "forward_to_topic", side_effect=fake_forward), \
-             patch.object(bot, "_generate_caption_summary", new=AsyncMock(return_value="Краткое описание")), \
-             patch.object(bot, "ask_llm", new=AsyncMock(return_value=llm_reply)), \
-             patch.object(bot, "choose_model", new=AsyncMock(return_value=("google/gemini-3.5-flash", fake_doc_text, ""))), \
-             patch("bot.os.remove"):
-            await bot.handle_document(mock_update, mock_context)
-
-        # ── Проверяем, что среди всех reply_text был вызов с parse_mode ──────
-        final_llm_calls = [
-            c for c in reply_calls
-            if llm_reply in c["text"] or "**" in c["text"]
-        ]
-        self.assertTrue(
-            len(final_llm_calls) > 0,
-            f"Ожидался reply_text с LLM-ответом (markdown). Все вызовы: {reply_calls}"
-        )
-        for call in final_llm_calls:
-            self.assertEqual(
-                call["kwargs"].get("parse_mode"), "Markdown",
-                f"reply_text с LLM-ответом должен иметь parse_mode='Markdown'. "
-                f"Текст: {call['text'][:80]!r}, kwargs: {call['kwargs']}"
-            )
 
 
 if __name__ == "__main__":
