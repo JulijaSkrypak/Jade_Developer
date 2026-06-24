@@ -614,7 +614,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # parse_mode убран: recognized_text — сырая транскрипция, может содержать
         # *, _, [ и другие символы, ломающие Telegram Markdown.
         final_reply = f"🎙️ {recognized_text}\n\n{reply}"
-        await update.message.reply_text(final_reply, parse_mode="Markdown")
+        await update.message.reply_text(final_reply)
 
         # ── Фаза 5: пересылка транскрипции в топик Тексты ─────────────────────
         # forward_to_topic сам ловит все ошибки — не нарушает основной flow
@@ -1954,7 +1954,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # LLM-ответ (reply) также не форматируем через parse_mode чтобы избежать
         # ошибок «Can't parse entities» при любых вложенных символах.
         final_reply = f"{emoji} {preview_text}\n\n{reply}"
-        await update.message.reply_text(final_reply, parse_mode="Markdown")
+        await update.message.reply_text(final_reply)
 
     except Exception as e:
         logger.error(f"Document handler error: {e}")
