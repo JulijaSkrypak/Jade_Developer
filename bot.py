@@ -190,8 +190,8 @@ def get_ai_analyze_keyboard() -> InlineKeyboardMarkup:
     """
     keyboard = [
         [
-            InlineKeyboardButton("Sonnet 4.6", callback_data="ai_analyze:sonnet"),
             InlineKeyboardButton("Gemini 3.5", callback_data="ai_analyze:gemini"),
+            InlineKeyboardButton("Sonnet 4.6", callback_data="ai_analyze:sonnet"),
             InlineKeyboardButton("Opus 4.8", callback_data="ai_analyze:opus"),
         ],
     ]
