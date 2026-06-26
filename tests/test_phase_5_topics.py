@@ -1135,6 +1135,33 @@ class TestCallbackHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dialog["model_choice"], "sonnet")
         self.assertEqual(dialog["history"], [])
 
+    async def test_callback_opus_analysis(self):
+        """Callback с моделью Opus отправляет правильное предложение."""
+        self.query.data = "ai_analyze:opus"
+        self.bot.save_forwarded_file(
+            chat_id=-100123,
+            message_id=456,
+            file_id="doc_id",
+            file_type="document",
+            file_name="report.pdf",
+            extracted_text="Содержимое отчета"
+        )
+
+        await self.bot.handle_ai_analyze_callback(self.update, self.context)
+
+        self.query.answer.assert_called_once()
+        self.bot_obj.send_message.assert_called_once()
+        
+        call_kwargs = self.bot_obj.send_message.call_args.kwargs
+        self.assertEqual(call_kwargs["chat_id"], -100123)
+        self.assertIn("Claude Opus 4.8. Ваш вопрос:", call_kwargs["text"])
+        self.assertEqual(call_kwargs["reply_to_message_id"], 456)
+
+        # Проверяем запись в БД с выбором модели opus
+        dialog = self.bot.get_file_dialog(-100123, 300)
+        self.assertIsNotNone(dialog)
+        self.assertEqual(dialog["model_choice"], "opus")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 17. build_caption — тег архива (Задача 2)
@@ -1475,6 +1502,20 @@ class TestCallbackDeferredMode(unittest.IsolatedAsyncioTestCase):
         call_kwargs = self.bot_obj.send_message.call_args.kwargs
         self.assertIn("Claude Sonnet 4.6. Ваш вопрос:", call_kwargs["text"])
 
+    async def test_sends_question_opus_analysis(self):
+        self.query.data = "ai_analyze:opus"
+        self.bot_module.save_forwarded_file(
+            chat_id=-100123, message_id=456,
+            file_id="doc_id", file_type="document",
+            file_name="report.pdf", extracted_text="Текст отчёта",
+        )
+        await self.bot_module.handle_ai_analyze_callback(self.update, self.context)
+
+        self.query.answer.assert_called_once()
+        self.bot_obj.send_message.assert_called_once()
+        call_kwargs = self.bot_obj.send_message.call_args.kwargs
+        self.assertIn("Claude Opus 4.8. Ваш вопрос:", call_kwargs["text"])
+
     async def test_file_dialogs_populated_with_correct_metadata(self):
         self.bot_module.save_forwarded_file(
             chat_id=-100123, message_id=456,
@@ -1726,6 +1767,27 @@ class TestExecuteFileDialogStep(unittest.IsolatedAsyncioTestCase):
         last_reply = self.mock_update.message.reply_text.call_args_list[1][0][0]
         self.assertIn("<b>Claude Sonnet 4.6:</b>", last_reply)
         self.assertIn("Результат анализа", last_reply)
+
+    @patch("ai_service.ask_llm", new_callable=AsyncMock, return_value="Результат анализа Opus")
+    async def test_sends_status_and_replies_with_result_opus(self, mock_ask):
+        self.bot_module.save_forwarded_file(
+            chat_id=9999, message_id=50,
+            file_id="doc_id", file_type="document",
+            file_name="report.pdf", extracted_text="Содержимое отчёта",
+        )
+        session = {
+            "file_message_id": 50, "model_choice": "opus",
+            "chat_id": 9999, "user_id": 1, "history": []
+        }
+        from bot import execute_file_dialog_step
+        await execute_file_dialog_step(
+            self.mock_update, self.context, session, "Найди выводы"
+        )
+        self.assertEqual(self.mock_update.message.reply_text.call_count, 2)
+        
+        last_reply = self.mock_update.message.reply_text.call_args_list[1][0][0]
+        self.assertIn("<b>Claude Opus 4.8:</b>", last_reply)
+        self.assertIn("Результат анализа Opus", last_reply)
 
     async def test_no_file_info_edits_status_with_warning(self):
         session = {

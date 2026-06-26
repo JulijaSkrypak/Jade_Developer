@@ -192,6 +192,7 @@ def get_ai_analyze_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("Sonnet 4.6", callback_data="ai_analyze:sonnet"),
             InlineKeyboardButton("Gemini 3.5", callback_data="ai_analyze:gemini"),
+            InlineKeyboardButton("Opus 4.8", callback_data="ai_analyze:opus"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -2081,6 +2082,9 @@ async def execute_file_dialog_step(
     if model_choice == "sonnet":
         model_id = os.getenv("MODEL_COMPLEX", "anthropic/claude-sonnet-4-6")
         friendly_model_name = "Claude Sonnet 4.6"
+    elif model_choice == "opus":
+        model_id = "anthropic/claude-opus-4-8"
+        friendly_model_name = "Claude Opus 4.8"
     else:
         model_id = os.getenv("MODEL_SIMPLE", "google/gemini-3.5-flash")
         friendly_model_name = "Gemini 3.5"
@@ -2237,8 +2241,8 @@ async def handle_ai_analyze_callback(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer()
 
-    data = query.data  # 'ai_analyze:sonnet|gemini'
-    model_choice = data.split(":")[1]  # 'sonnet', 'gemini'
+    data = query.data  # 'ai_analyze:sonnet|gemini|opus'
+    model_choice = data.split(":")[1]  # 'sonnet', 'gemini', 'opus'
 
     message = query.message
     chat_id = message.chat.id
@@ -2259,6 +2263,8 @@ async def handle_ai_analyze_callback(update: Update, context: ContextTypes.DEFAU
 
     if model_choice == "sonnet":
         friendly_model_name = "Claude Sonnet 4.6"
+    elif model_choice == "opus":
+        friendly_model_name = "Claude Opus 4.8"
     else:
         friendly_model_name = "Gemini 3.5"
 
